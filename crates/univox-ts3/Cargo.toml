@@ -17,3 +17,6 @@ tracing.workspace = true
 bytes.workspace = true
 base64.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+test-support.workspace = true
