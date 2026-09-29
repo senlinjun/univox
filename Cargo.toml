@@ -33,7 +33,7 @@ bitflags = "2"
 # crypto (TS3)
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "arithmetic"] }
 curve25519-dalek = "4"
-eax = "0.6"
+eax = "0.5"
 sha1 = "0.10"
 sha2 = "0.10"
 num-bigint-dig = "0.8"
