@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/univox-core",
+    "crates/univox-ts3-proto",
+    "crates/univox-ts3",
+    "crates/univox-voice",
+    "crates/univox",
+    "crates/test-support",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/univox"
+
+[workspace.dependencies]
+# async
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal", "process", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+
+# util
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+base64 = "0.22"
+bitflags = "2"
+
+# crypto (TS3)
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "arithmetic"] }
+curve25519-dalek = "4"
+eax = "0.6"
+sha1 = "0.10"
+sha2 = "0.10"
+num-bigint-dig = "0.8"
+
+# univox crates
+univox-core = { path = "crates/univox-core" }
+univox-ts3-proto = { path = "crates/univox-ts3-proto" }
+univox-ts3 = { path = "crates/univox-ts3" }
+univox-voice = { path = "crates/univox-voice" }
+
+# test
+test-support = { path = "crates/test-support" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

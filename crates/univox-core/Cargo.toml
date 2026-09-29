@@ -1,0 +1,14 @@
+[package]
+name = "univox-core"
+description = "Univox unified voice-platform abstractions: data model, sessions, events, audio traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true

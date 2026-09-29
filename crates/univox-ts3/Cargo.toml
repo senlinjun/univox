@@ -1,0 +1,19 @@
+[package]
+name = "univox-ts3"
+description = "TeamSpeak 3 driver for Univox: native client protocol + ServerQuery management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+univox-core.workspace = true
+univox-ts3-proto.workspace = true
+univox-voice.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+base64.workspace = true
+rand.workspace = true

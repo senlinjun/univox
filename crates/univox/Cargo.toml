@@ -1,0 +1,13 @@
+[package]
+name = "univox"
+description = "Univox facade: one API for multiple voice platforms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+univox-core.workspace = true
+univox-ts3.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true

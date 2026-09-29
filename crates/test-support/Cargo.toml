@@ -1,0 +1,11 @@
+[package]
+name = "test-support"
+description = "Integration-test harness that boots a local TeamSpeak 3 server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true

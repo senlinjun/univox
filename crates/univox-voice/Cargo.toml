@@ -1,0 +1,13 @@
+[package]
+name = "univox-voice"
+description = "Platform-agnostic voice pipeline: jitter buffer, mixer, opus codec wrapper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+univox-core.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
