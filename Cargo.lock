@@ -985,7 +985,10 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bytes",
+ "curve25519-dalek",
  "futures",
+ "num-bigint-dig",
+ "quicklz",
  "rand",
  "test-support",
  "thiserror 2.0.21",

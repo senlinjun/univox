@@ -121,12 +121,16 @@ impl Licenses {
         Ok(BLOCK_MIN_LEN + extra)
     }
 
-    /// Derive the final public key: `pub_k * clamp(sha512(block[1..])) + parent`,
-    /// starting from the TS3 root point.
+    /// Derive the final public key from the TS3 root point.
     pub fn derive_public_key(&self) -> Result<EdwardsPoint> {
         let root = CompressedEdwardsY(ROOT_KEY)
             .decompress()
             .ok_or_else(|| Error::Crypto("invalid root key".into()))?;
+        self.derive_public_key_from(root)
+    }
+
+    /// Derive the final public key from an explicit root point.
+    pub fn derive_public_key_from(&self, root: EdwardsPoint) -> Result<EdwardsPoint> {
         let mut last = root;
         let mut offset = 1;
         for block in &self.blocks {

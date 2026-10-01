@@ -4,6 +4,8 @@
 //! - [`query`]: ServerQuery management driver (telnet-style TCP).
 //! - client protocol (UDP voice + control) — under construction.
 
+pub mod client;
 pub mod query;
 
+pub use client::{HandshakeOptions, UdpConnection};
 pub use query::{QueryConnection, QueryOptions, QuerySession};
