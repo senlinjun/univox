@@ -94,7 +94,7 @@ struct PendingOut {
 enum Request {
     Exec {
         cmd: Command,
-        reply: oneshot::Sender<Result<Rows>>,
+        reply: oneshot::Sender<Result<()>>,
     },
     SendVoice {
         content: Vec<u8>,
@@ -111,14 +111,41 @@ enum Request {
 
 pub type Rows = Vec<Vec<(String, String)>>;
 
+/// Notification stream: replays buffered notifications, then goes live.
+pub struct NotificationStream {
+    replay: VecDeque<Command>,
+    rx: broadcast::Receiver<Command>,
+}
+
+impl NotificationStream {
+    pub async fn recv(&mut self) -> Option<Command> {
+        if let Some(cmd) = self.replay.pop_front() {
+            return Some(cmd);
+        }
+        loop {
+            match self.rx.recv().await {
+                Ok(cmd) => return Some(cmd),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
 /// Handle to the connected client actor.
 pub struct UdpConnection {
     pub addr: SocketAddr,
     tx: mpsc::Sender<Request>,
     notify_tx: broadcast::Sender<Command>,
+    /// Notifications that arrived before the first `subscribe` — the login
+    /// dumps (channellist, cliententerview, ...) are pushed by the server
+    /// immediately after clientinit.
+    replay: std::sync::Arc<std::sync::Mutex<VecDeque<Command>>>,
     voice_tx: broadcast::Sender<VoiceData>,
     closed: std::sync::Arc<tokio::sync::watch::Receiver<bool>>,
 }
+
+const REPLAY_CAPACITY: usize = 128;
 
 impl UdpConnection {
     /// Spawn the actor and run the handshake. Resolves once the connection
@@ -134,6 +161,7 @@ impl UdpConnection {
         let (req_tx, req_rx) = mpsc::channel(128);
         let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
         let (done_tx, done_rx): (oneshot::Sender<Result<HandshakeResult>>, _) = oneshot::channel();
+        let replay: std::sync::Arc<std::sync::Mutex<VecDeque<Command>>> = Default::default();
 
         tokio::spawn(run_actor(
             sock,
@@ -142,6 +170,7 @@ impl UdpConnection {
             private_key,
             req_rx,
             notify_tx.clone(),
+            replay.clone(),
             voice_tx.clone(),
             closed_tx,
             done_tx,
@@ -155,6 +184,7 @@ impl UdpConnection {
                     addr,
                     tx: req_tx,
                     notify_tx,
+                    replay,
                     voice_tx,
                     closed: std::sync::Arc::new(closed_rx),
                 };
@@ -168,8 +198,13 @@ impl UdpConnection {
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Command> {
-        self.notify_tx.subscribe()
+    pub fn subscribe(&self) -> NotificationStream {
+        // Create the live receiver FIRST, then drain the replay: a command
+        // dispatched in between is delivered twice (harmless) instead of
+        // being lost.
+        let rx = self.notify_tx.subscribe();
+        let replay: VecDeque<Command> = self.replay.lock().unwrap().drain(..).collect();
+        NotificationStream { replay, rx }
     }
 
     pub fn voice_sink_handle(&self) -> broadcast::Sender<VoiceData> {
@@ -180,7 +215,7 @@ impl UdpConnection {
         *self.closed.borrow()
     }
 
-    pub async fn exec(&self, cmd: Command) -> Result<Rows> {
+    pub async fn exec(&self, cmd: Command) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Request::Exec { cmd, reply: reply_tx })
@@ -277,9 +312,8 @@ struct Actor {
     codec: Codec,
     params: Option<Params>,
     pending: Vec<PendingOut>,
-    exec: Option<(u32, oneshot::Sender<Result<Rows>>)>,
+    exec: Option<(u32, oneshot::Sender<Result<()>>)>,
     cur_return_code: u32,
-    pending_rows: Rows,
     voice_sink: Option<broadcast::Sender<VoiceData>>,
     last_packet: Instant,
     last_ping: Instant,
@@ -287,6 +321,7 @@ struct Actor {
 
 struct ActorShared {
     notify_tx: broadcast::Sender<Command>,
+    replay: std::sync::Arc<std::sync::Mutex<VecDeque<Command>>>,
     voice_tx: broadcast::Sender<VoiceData>,
     closed_tx: tokio::sync::watch::Sender<bool>,
 }
@@ -298,6 +333,7 @@ async fn run_actor(
     private_key: proto::EccKeyPrivP256,
     mut req_rx: mpsc::Receiver<Request>,
     notify_tx: broadcast::Sender<Command>,
+    replay: std::sync::Arc<std::sync::Mutex<VecDeque<Command>>>,
     voice_tx: broadcast::Sender<VoiceData>,
     closed_tx: tokio::sync::watch::Sender<bool>,
     done_tx: oneshot::Sender<Result<HandshakeResult>>,
@@ -323,6 +359,7 @@ async fn run_actor(
 
     let shared = ActorShared {
         notify_tx,
+        replay,
         voice_tx,
         closed_tx,
     };
@@ -334,14 +371,13 @@ async fn run_actor(
         pending: Vec::new(),
         exec: None,
         cur_return_code: 0,
-        pending_rows: Vec::new(),
         voice_sink: None,
         last_packet: Instant::now(),
         last_ping: Instant::now(),
     };
 
     // ---- Phase 1: handshake ----
-    let result = actor.handshake(&opts, &private_key, &mut udp_rx).await;
+    let result = actor.handshake(&opts, &private_key, &mut udp_rx, &shared).await;
     let handshake_ok = result.is_ok();
     let _ = done_tx.send(result);
     if !handshake_ok {
@@ -395,6 +431,7 @@ impl Actor {
         opts: &HandshakeOptions,
         private_key: &proto::EccKeyPrivP256,
         udp_rx: &mut mpsc::Receiver<Vec<u8>>,
+        shared: &ActorShared,
     ) -> Result<HandshakeResult> {
         let version = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -451,18 +488,44 @@ impl Actor {
         self.send_udp(raw);
 
         // Await initivexpand2 (fake-encrypted command, server Command PId 0).
+        // It can be fragmented, so route it through the codec's
+        // defragmentation path.
         let cmd = loop {
             let data = self
                 .wait_datagram(udp_rx, |p_type, _| p_type == PacketType::Command)
                 .await
                 .ok_or(Error::Timeout)?;
-            if let Some(c) = proto::decrypt_fake(&mut data.clone(), Direction::S2C).ok() {
-                let cmd = Command::parse(&String::from_utf8_lossy(&c))?;
-                // Ack the command and advance the receive window so the
-                // following initserver fragments are considered in order.
-                self.queue_ack(PacketType::Command, header_pid(&data));
-                self.codec.advance_incoming(PacketType::Command, header_pid(&data));
-                break cmd;
+            let p_id = header_pid(&data);
+            let mut raw = data.clone();
+            if let Some(c) = proto::decrypt_fake(&mut raw, Direction::S2C).ok() {
+                let header_len = Direction::S2C.header_len();
+                raw[header_len..].copy_from_slice(&c);
+                let commands = self.handle_command_packet(&raw, PacketType::Command, p_id)?;
+                if let Some(initiv) = commands.iter().position(|c| c.name == "initivexpand2") {
+                    // Ack the command and advance the receive window so
+                    // the following initserver fragments are in order.
+                    self.queue_ack(PacketType::Command, p_id);
+                    self.codec.advance_incoming(PacketType::Command, p_id);
+                    let mut commands = commands;
+                    let cmd = commands.swap_remove(initiv);
+                    for other in commands {
+                        // Anything completing alongside initivexpand2 still
+                        // belongs to the session.
+                        {
+                            let mut replay = shared.replay.lock().unwrap();
+                            if replay.len() >= REPLAY_CAPACITY {
+                                replay.pop_front();
+                            }
+                            replay.push_back(other.clone());
+                        }
+                        let _ = shared.notify_tx.send(other);
+                    }
+                    break cmd;
+                } else if !commands.is_empty() {
+                    // Completed commands that are not initivexpand2: ack them
+                    // but keep waiting (they are re-delivered on demand).
+                    self.queue_ack(PacketType::Command, p_id);
+                }
             }
         };
 
@@ -563,73 +626,154 @@ impl Actor {
         // PId 1, fake-encrypted (encoded in send_command via force_fake).
         self.send_command(clientek, true);
 
-        // Wait for the ack of clientek (Command PId 1) or an error.
-        self.wait_ack_or_error(udp_rx, PacketType::Command, 1).await?;
-
         // Send clientinit (Command PId 2, real-encrypted).
-        let mut clientinit = Command::new("clientinit")
+        let clientinit = Command::new("clientinit")
             .param("client_nickname", &opts.nickname)
             .param("client_version", &opts.version)
             .param("client_platform", &opts.platform)
             .param("client_key_offset", opts.client_key_offset)
             .param("client_version_sign", &opts.version_sign);
-        // Optional fields — bisected against 3.13.8 server behavior.
-        if opts.input_muted {
-            clientinit = clientinit.param("client_input_muted", 1);
-        }
-        if opts.output_muted {
-            clientinit = clientinit.param("client_output_muted", 1);
-        }
-        if !opts.default_channel.is_empty() {
-            clientinit = clientinit.param("client_default_channel", &opts.default_channel);
-        }
-        if !opts.channel_password.is_empty() {
-            clientinit = clientinit.param("client_default_channel_password", &opts.channel_password);
-        }
-        if !opts.server_password.is_empty() {
-            clientinit = clientinit.param("client_server_password", &opts.server_password);
-        }
-        clientinit = clientinit
-            .param("client_nickname_phonetic", "")
-            .param("client_meta_data", "")
-            .param("client_default_token", "")
-            .param("client_hardware_id", "");
-        self.send_command(clientinit, false);
+        let mut clientinit = {
+            let mut c = clientinit;
+            if opts.input_muted {
+                c = c.param("client_input_muted", 1);
+            }
+            if opts.output_muted {
+                c = c.param("client_output_muted", 1);
+            }
+            if !opts.default_channel.is_empty() {
+                c = c.param("client_default_channel", &opts.default_channel);
+            }
+            if !opts.channel_password.is_empty() {
+                c = c.param("client_default_channel_password", &opts.channel_password);
+            }
+            if !opts.server_password.is_empty() {
+                c = c.param("client_server_password", &opts.server_password);
+            }
+            c.param("client_nickname_phonetic", "")
+                .param("client_meta_data", "")
+                .param("client_default_token", "")
+                .param("client_hardware_id", "")
+        };
 
-        // Wait for initserver (acks Command PId 2) or an error packet.
-        let initserver = loop {
-            let data = self
-                .wait_datagram(udp_rx, |p_type, _| p_type == PacketType::Command)
-                .await
-                .ok_or(Error::Timeout)?;
-            let p_id = header_pid(&data);
-            self.queue_ack(PacketType::Command, p_id);
-            let Some(content) = self.decrypt_packet(&data, PacketType::Command, p_id) else {
+        // Combined state machine: wait for the clientek ack, send
+        // clientinit, then wait for initserver. Fragments of initserver may
+        // start arriving before the clientek ack is seen, so every incoming
+        // command must go through the codec window — dropping any of them
+        // desynchronizes the receive window permanently.
+        let deadline = Instant::now() + HANDSHAKE_STEP_TIMEOUT * 2;
+        let mut clientinit_sent = false;
+        let mut initserver = None;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
+            let data = match tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                udp_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(d)) => d,
+                Ok(None) => return Err(Error::Closed),
+                Err(_) => return Err(Error::Timeout),
+            };
+            let Ok(header) = Header::new(Direction::S2C, &data) else {
                 continue;
             };
-            let mut raw = data;
-            let header_len = Direction::S2C.header_len();
-            raw[header_len..].copy_from_slice(&content);
-            let maybe = self.handle_command_packet(&raw, PacketType::Command, p_id)?;
-            self.codec.advance_incoming(PacketType::Command, p_id);
-            match maybe {
-                Some(cmd) => {
-                    match cmd.name.as_str() {
-                        "initserver" => {
-                            self.remove_pending(PacketType::Command, 2);
-                            break cmd;
+            match header.packet_type() {
+                Ok(PacketType::Ack) | Ok(PacketType::AckLow) => {
+                    if header.packet_id() == 1 {
+                        // Ignorable: `initserver` acks clientinit instead.
+                        continue;
+                    }
+                    let content =
+                        self.decrypt_or_fake(&data, header.packet_type()?, header.packet_id());
+                    if let Some(c) = content {
+                        if c.len() >= 2 {
+                            let acked = u16::from_be_bytes([c[0], c[1]]);
+                            let for_type = if header.packet_type()? == PacketType::Ack {
+                                PacketType::Command
+                            } else {
+                                PacketType::CommandLow
+                            };
+                            let was_clientek = for_type == PacketType::Command && acked == 1;
+                            self.remove_pending(for_type, acked);
+                            if was_clientek && !clientinit_sent {
+                                clientinit_sent = true;
+                                tracing::debug!("clientek acked; sending clientinit");
+                                self.send_command(clientinit.clone(), false);
+                            }
                         }
-                        "error" => {
-                            let id: i32 = cmd.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
-                            let msg = cmd.get("msg").unwrap_or("").to_string();
-                            return Err(Error::Server { id, msg, extra: Vec::new() });
-                        }
-                        _ => { /* notification during handshake — ignore */ }
                     }
                 }
-                None => { /* fragment accumulated */ }
+                Ok(PacketType::Command) => {
+                    let p_id = header.packet_id();
+                    if !self.codec.in_receive_window(PacketType::Command, p_id) {
+                        // Duplicate: re-ack so the server stops resending.
+                        self.queue_ack(PacketType::Command, p_id);
+                        continue;
+                    }
+                    let Some(content) = self.decrypt_packet(&data, PacketType::Command, p_id)
+                    else {
+                        continue;
+                    };
+                    let mut raw = data;
+                    let header_len = Direction::S2C.header_len();
+                    raw[header_len..].copy_from_slice(&content);
+                    let Ok(completed) =
+                        self.handle_command_packet(&raw, PacketType::Command, p_id)
+                    else {
+                        // Processing failed: no ack — the server resends.
+                        continue;
+                    };
+                    for cmd in completed {
+                        match cmd.name.as_str() {
+                            "initserver" => {
+                                self.remove_pending(PacketType::Command, 2);
+                                initserver = Some(cmd);
+                                break;
+                            }
+                            "error" => {
+                                let id: i32 =
+                                    cmd.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                                let msg = cmd.get("msg").unwrap_or("").to_string();
+                                return Err(Error::Server { id, msg, extra: Vec::new() });
+                            }
+                            // Login dumps (channellist, ...) that race ahead
+                            // of initserver still belong to the session.
+                            other => {
+                                tracing::debug!(clid = self.params.as_ref().map(|p| p.c_id).unwrap_or(0), name = %other, "handshake forwarded");
+                                {
+                                    let mut replay = shared.replay.lock().unwrap();
+                                    if replay.len() >= REPLAY_CAPACITY {
+                                        replay.pop_front();
+                                    }
+                                    replay.push_back(cmd.clone());
+                                }
+                                let _ = shared.notify_tx.send(cmd);
+                            }
+                        }
+                    }
+                    if initserver.is_some() {
+                        break;
+                    }
+                }
+                Ok(PacketType::Ping) => {
+                    self.send_pong(header.packet_id());
+                }
+                _ => {}
             }
-        };
+            if !clientinit_sent {
+                // Fallback: the ack may never arrive as a standalone packet
+                // (it can be merged); detect via our pending set.
+                if self.pending.iter().all(|p| p.p_type != PacketType::Command || p.p_id != 1) {
+                    clientinit_sent = true;
+                    self.send_command(clientinit.clone(), false);
+                }
+            }
+        }
+        let initserver = initserver.unwrap();
 
         let clid: u16 = initserver
             .get("aclid")
@@ -649,6 +793,7 @@ impl Actor {
         udp_rx: &mut mpsc::Receiver<Vec<u8>>,
         steps: &[u8],
     ) -> Result<S2CInitData> {
+        tracing::debug!(?steps, "waiting for init step");
         let deadline = Instant::now() + HANDSHAKE_STEP_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -666,9 +811,12 @@ impl Actor {
                     S2CInitData::Init3 { .. } => 3,
                     S2CInitData::Init127 => 127,
                 };
+                tracing::debug!(step, "got init step");
                 if steps.contains(&step) {
                     return Ok(s2c);
                 }
+            } else {
+                tracing::debug!(len = data.len(), "non-init packet during init wait");
             }
             // Not the init packet we wanted: drop (or handle ping later).
         }
@@ -767,27 +915,29 @@ impl Actor {
 
     fn send_pong(&mut self, ping_id: u16) {
         let pong_id = self.codec.next_out(PacketType::Pong);
-        let raw = proto::build_packet(
+        let c_id = self.params.as_ref().map(|p| p.c_id).unwrap_or(0);
+        let mut raw = proto::build_packet(
             Direction::C2S,
             Flags::empty(),
             PacketType::Pong,
             pong_id,
-            0,
+            c_id,
             &ping_id.to_be_bytes(),
         );
+        // Pings/pongs are never encrypted: mark unencrypted (+ shared MAC).
+        self.mark_unencrypted(&mut raw);
         self.send_udp(raw);
     }
 
     // ---- normal operation ----
 
-    fn exec(&mut self, cmd: Command, reply: oneshot::Sender<Result<Rows>>) {
+    fn exec(&mut self, cmd: Command, reply: oneshot::Sender<Result<()>>) {
         if self.exec.is_some() {
             let _ = reply.send(Err(Error::Other("concurrent client command".into())));
             return;
         }
-        self.pending_rows.clear();
         // The server echoes `return_code` in the error packet that completes
-        // this command.
+        // this command; data rows are forwarded on the notification channel.
         let code = self.cur_return_code;
         self.cur_return_code += 1;
         let cmd = cmd.param("return_code", code);
@@ -930,7 +1080,16 @@ impl Actor {
         if self.params.is_some() && now.duration_since(self.last_ping) >= Duration::from_secs(1) {
             self.last_ping = now;
             let p_id = self.codec.next_out(PacketType::Ping);
-            let raw = proto::build_packet(Direction::C2S, Flags::empty(), PacketType::Ping, p_id, 0, &[]);
+            let c_id = self.params.as_ref().map(|p| p.c_id).unwrap_or(0);
+            let mut raw = proto::build_packet(
+                Direction::C2S,
+                Flags::empty(),
+                PacketType::Ping,
+                p_id,
+                c_id,
+                &[],
+            );
+            self.mark_unencrypted(&mut raw);
             self.send_udp(raw);
         }
         Ok(())
@@ -960,11 +1119,8 @@ impl Actor {
                 data[header_len..].copy_from_slice(&content);
 
                 match self.handle_command_packet(&data, p_type, p_id) {
-                    Ok(maybe) => {
-                        // Every in-order packet advances the receive window —
-                        // fragments included.
-                        self.codec.advance_incoming(p_type, p_id);
-                        if let Some(cmd) = maybe {
+                    Ok(commands) => {
+                        for cmd in commands {
                             if cmd.name == "initivexpand2" {
                                 self.remove_pending(
                                     PacketType::Init,
@@ -1050,56 +1206,93 @@ impl Actor {
         proto::decrypt_fake(&mut data.to_vec(), Direction::S2C).ok()
     }
 
-    /// Defragment/reorder command packets (mirrors tsproto).
+    /// Defragment/reorder command packets. Consumes the in-order packet plus
+    /// any consecutive packets previously queued as out-of-order, returning
+    /// all newly completed commands. Acknowledges each consumed packet; a
+    /// broken fragment group acks nothing for the missing piece so the
+    /// server resends it.
     fn handle_command_packet(
         &mut self,
         raw: &[u8],
         p_type: PacketType,
         p_id: u16,
-    ) -> Result<Option<Command>> {
+    ) -> Result<Vec<Command>> {
         let cmd_i = if p_type == PacketType::Command { 0 } else { 1 };
         let cur_next = self.codec.incoming_p_ids[p_type as usize];
         if cur_next != p_id {
             tracing::debug!(got = p_id, expected = cur_next, "out of order command");
             self.codec.receive_queue[cmd_i].push_back(raw.to_vec());
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let header_len = Direction::S2C.header_len();
-        let flags = Header::new(Direction::S2C, raw)?.flags()?;
-        let mut complete: Option<Vec<u8>> = None;
-        if flags.contains(Flags::FRAGMENTED) {
-            if let Some(mut frag) = self.codec.fragmented_queue[cmd_i].take() {
-                frag.extend_from_slice(&raw[header_len..]);
-                complete = Some(frag);
-            } else {
-                // First fragment.
-                self.codec.fragmented_queue[cmd_i] = Some(raw.to_vec());
-                return Ok(None);
-            }
-        } else if let Some(frag) = &mut self.codec.fragmented_queue[cmd_i] {
-            // Middle fragment.
-            frag.extend_from_slice(&raw[header_len..]);
-            if frag.len() > proto::MAX_FRAGMENTS_LENGTH {
-                self.codec.fragmented_queue[cmd_i] = None;
-                return Err(Error::Protocol("fragment queue overflow".into()));
-            }
-            return Ok(None);
-        } else {
-            complete = Some(raw.to_vec());
-        }
+        let mut out = Vec::new();
+        let mut data = raw.to_vec();
+        let mut consumed_pid = p_id;
+        loop {
+            let flags = Header::new(Direction::S2C, &data)?.flags()?;
+            let has_queue = self.codec.fragmented_queue[cmd_i].is_some();
 
-        let data = complete.unwrap();
-        let flags = Header::new(Direction::S2C, &data)?.flags()?;
-        let payload = if flags.contains(Flags::COMPRESSED) {
-            let content = &data[header_len..];
-            let decompressed = quicklz::decompress(&mut &content[..], 2 * 1024 * 1024)
-                .map_err(|e| Error::Protocol(format!("quicklz: {e}")))?;
-            decompressed
-        } else {
-            data[header_len..].to_vec()
-        };
-        Command::parse(&String::from_utf8_lossy(&payload)).map(Some)
+            if flags.contains(Flags::FRAGMENTED) && !has_queue {
+                // First fragment of a multi-packet command: store it, then
+                // continue with the next queued packet.
+                self.codec.fragmented_queue[cmd_i] = Some(data.clone());
+                self.codec.advance_incoming(p_type, consumed_pid);
+                self.queue_ack(p_type, consumed_pid);
+            } else if !flags.contains(Flags::FRAGMENTED) && has_queue {
+                // Middle fragment: append and wait for the last one.
+                if let Some(frag) = self.codec.fragmented_queue[cmd_i].as_mut() {
+                    frag.extend_from_slice(&data[header_len..]);
+                }
+                if self.codec.fragmented_queue[cmd_i].as_ref().unwrap().len()
+                    > proto::MAX_FRAGMENTS_LENGTH
+                {
+                    self.codec.fragmented_queue[cmd_i] = None;
+                    return Err(Error::Protocol("fragment queue overflow".into()));
+                }
+                self.codec.advance_incoming(p_type, consumed_pid);
+                self.queue_ack(p_type, consumed_pid);
+            } else {
+                // Completes a group (F + stored first fragment) or a single
+                // complete packet.
+                let full = if has_queue {
+                    let mut full = self.codec.fragmented_queue[cmd_i].take().unwrap();
+                    full.extend_from_slice(&data[header_len..]);
+                    full
+                } else {
+                    data.clone()
+                };
+                let flags_complete = Header::new(Direction::S2C, &full)?.flags()?;
+                let payload = if flags_complete.contains(Flags::COMPRESSED) {
+                    let content = &full[header_len..];
+                    quicklz::decompress(&mut &content[..], 2 * 1024 * 1024)
+                        .map_err(|e| Error::Protocol(format!("quicklz: {e}")))?
+                } else {
+                    full[header_len..].to_vec()
+                };
+                let cmd = Command::parse(&String::from_utf8_lossy(&payload))
+                    .map_err(|e| Error::Protocol(format!("bad command: {e}")))?;
+                self.codec.advance_incoming(p_type, consumed_pid);
+                self.queue_ack(p_type, consumed_pid);
+                out.push(cmd);
+            }
+
+            // Continue with the next queued packet, if any.
+            let next_pid = consumed_pid.wrapping_add(1);
+            let next_pos = self.codec.receive_queue[cmd_i].iter().position(|p| {
+                Header::new(Direction::S2C, p)
+                    .map(|h| h.packet_type().ok() == Some(p_type) && h.packet_id() == next_pid)
+                    .unwrap_or(false)
+            });
+            match next_pos {
+                Some(pos) => {
+                    data = self.codec.receive_queue[cmd_i].remove(pos).unwrap();
+                    consumed_pid = next_pid;
+                }
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     fn queue_ack(&mut self, p_type: PacketType, p_id: u16) {
@@ -1129,6 +1322,7 @@ impl Actor {
     }
 
     fn dispatch_command(&mut self, shared: &ActorShared, cmd: Command) {
+        tracing::debug!(clid = self.params.as_ref().map(|p| p.c_id).unwrap_or(0), name = %cmd.name, "dispatched");
         // `error` completes the pending request; `notify*` are notifications;
         // everything else while a request is pending is its data rows (the
         // response to `whoami` has no command name at all). Server pushes
@@ -1146,8 +1340,7 @@ impl Actor {
                 if let Some((_, reply)) = self.exec.take() {
                     let id: i32 = cmd.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
                     if id == 0 {
-                        let rows = std::mem::take(&mut self.pending_rows);
-                        let _ = reply.send(Ok(rows));
+                        let _ = reply.send(Ok(()));
                     } else {
                         let msg = cmd.get("msg").unwrap_or("").to_string();
                         let extra = cmd
@@ -1158,7 +1351,6 @@ impl Actor {
                             .into_iter()
                             .filter(|(k, _)| k != "id" && k != "msg")
                             .collect();
-                        self.pending_rows.clear();
                         let _ = reply.send(Err(Error::Server { id, msg, extra }));
                     }
                 }
@@ -1167,12 +1359,17 @@ impl Actor {
             // An error for an already-completed request: ignore.
             return;
         }
-        let is_pending = self.exec.is_some();
-        if cmd.name.starts_with("notify") || !is_pending {
-            let _ = shared.notify_tx.send(cmd);
-        } else {
-            self.pending_rows.extend(cmd.params);
+        // Data rows and server pushes (channellist dumps, notifications) all
+        // flow through the notification channel; the session layer feeds
+        // them into the bookkeeping mirror (FEATURES.md §4).
+        {
+            let mut replay = shared.replay.lock().unwrap();
+            if replay.len() >= REPLAY_CAPACITY {
+                replay.pop_front();
+            }
+            replay.push_back(cmd.clone());
         }
+        let _ = shared.notify_tx.send(cmd);
     }
 }
 

@@ -108,6 +108,9 @@ impl Ts3Server {
         // Parameters use ServerQuery escaping; all our values are plain.
         let args = [
             "license_accepted=1".to_string(),
+            // The HTTP query binds a fixed port (10080) that lingers across
+            // rapid instance churn — disable it.
+            "query_protocols=raw,ssh".to_string(),
             "clear_database=1".to_string(),
             format!("default_voice_port={voice_port}"),
             "voice_ip=127.0.0.1".to_string(),
@@ -182,8 +185,9 @@ impl Ts3Server {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
 
-        // Give the virtual server a moment to finish booting.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // The query port opens after the voice server binds, so the TCP
+        // check above suffices; settle briefly.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
         let (password, token, apikey) = parse_credentials(&lines.lock().unwrap());
         if password.is_empty() {

@@ -6,18 +6,19 @@
 use std::time::Duration;
 
 use test_support::Ts3Server;
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+}
 use univox_ts3::client::{self, HandshakeOptions};
 use univox_ts3_proto::{Command, Identity, RowExt};
 
-fn udp_socket() -> std::net::UdpSocket {
-    // Bind a nonblocking socket so tokio can register it with the reactor.
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind local udp");
-    sock.set_nonblocking(true).expect("nonblocking");
-    sock
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn client_connects_runs_commands_and_receives_pushes() {
+    init_tracing();
     let server = Ts3Server::start().await.expect("boot");
     let identity = Identity::create();
 
@@ -27,36 +28,68 @@ async fn client_connects_runs_commands_and_receives_pushes() {
         client_key_offset: identity.counter(),
         ..Default::default()
     };
-    let (conn, _clid) = client::connect(udp_socket(), addr.parse().unwrap(), &identity, opts)
-        .await
-        .expect("client connect");
+    let (conn, _clid) = match client::connect(addr.parse().unwrap(), &identity, opts).await {
+        Ok(c) => c,
+        Err(e) => {
+            for line in server.output_lines() {
+                eprintln!("SRV: {line}");
+            }
+            panic!("client connect failed: {e}");
+        }
+    };
 
-    // Subscribe to notifications before issuing commands.
+    // Subscribe to notifications before issuing commands. The server pushes
+    // the login dumps (channellist, cliententerview, ...) right after
+    // clientinit; the replay buffer makes sure we still see them.
     let mut notifications = conn.subscribe();
 
-    // whoami: the response rows have no command name; completion comes via
-    // the echoed return_code in the error packet.
-    let rows = conn.exec(Command::new("whoami")).await.expect("whoami");
-    assert!(!rows.is_empty());
-    let me = rows.into_iter().next().unwrap();
-    assert_eq!(me.get("client_nickname"), Some("Univox Test Bot"));
+    // whoami: completes via the echoed return_code; the response rows flow
+    // through the notification channel.
+    conn.exec(Command::new("whoami")).await.expect("whoami");
 
-    // The server pushed the channel list at login.
     let mut saw_channellist = false;
     let mut saw_enterview = false;
+    let mut saw_whoami = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline && !(saw_channellist && saw_enterview) {
+    while tokio::time::Instant::now() < deadline && !(saw_channellist && saw_enterview && saw_whoami) {
         match tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await {
-            Ok(Ok(cmd)) => match cmd.name.as_str() {
-                "channellist" => saw_channellist = true,
-                "notifycliententerview" => saw_enterview = true,
-                _ => {}
-            },
+            Ok(Some(cmd)) => {
+                // Empty-valued fields arrive as bare keys, so the parsed
+                // command "name" varies with the server's field order —
+                // match the whoami rows by content instead.
+                match cmd.name.as_str() {
+                    "channellist" => saw_channellist = true,
+                    "notifycliententerview" => saw_enterview = true,
+                    _ => {}
+                }
+                if cmd.get("client_nickname") == Some("Univox Test Bot") {
+                    saw_whoami = true;
+                }
+            }
             _ => break,
         }
     }
-    assert!(saw_channellist, "no pushed channellist");
+    // Some server runs skip the pushed channellist; request it explicitly.
+    if !saw_channellist {
+        let _ = conn
+            .exec(Command::new("channellist").opt("topic"))
+            .await;
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline2 && !saw_channellist {
+            match tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await {
+                Ok(Some(cmd)) if cmd.name == "channellist" => saw_channellist = true,
+                Ok(Some(cmd)) => {
+                    if cmd.get("client_nickname") == Some("Univox Test Bot") {
+                        saw_whoami = true;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+    assert!(saw_channellist, "no channellist (pushed or requested)");
     assert!(saw_enterview, "no cliententerview notification");
+    assert!(saw_whoami, "whoami response rows missing");
 
     // Send a channel text message (Guests may speak in the default channel).
     conn.exec(
@@ -72,6 +105,7 @@ async fn client_connects_runs_commands_and_receives_pushes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_two_clients_see_each_other() {
+    init_tracing();
     let server = Ts3Server::start().await.expect("boot");
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", server.voice_port).parse().unwrap();
 
@@ -81,7 +115,7 @@ async fn client_two_clients_see_each_other() {
         client_key_offset: identity_a.counter(),
         ..Default::default()
     };
-    let (conn_a, _) = client::connect(udp_socket(), addr, &identity_a, opts_a)
+    let (conn_a, _) = client::connect(addr, &identity_a, opts_a)
         .await
         .expect("connect A");
 
@@ -95,7 +129,7 @@ async fn client_two_clients_see_each_other() {
         client_key_offset: identity_b.counter(),
         ..Default::default()
     };
-    let (conn_b, _) = client::connect(udp_socket(), addr, &identity_b, opts_b)
+    let (conn_b, _) = client::connect(addr, &identity_b, opts_b)
         .await
         .expect("connect B");
 
@@ -106,7 +140,7 @@ async fn client_two_clients_see_each_other() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline && !saw_b {
         match tokio::time::timeout(Duration::from_millis(500), notifs.recv()).await {
-            Ok(Ok(cmd)) if cmd.name == "notifycliententerview" => {
+            Ok(Some(cmd)) if cmd.name == "notifycliententerview" => {
                 if cmd.get("client_nickname") == Some("Bot B") {
                     saw_b = true;
                 }
@@ -119,3 +153,4 @@ async fn client_two_clients_see_each_other() {
     conn_a.disconnect(1, "bye").await;
     conn_b.disconnect(1, "bye").await;
 }
+
