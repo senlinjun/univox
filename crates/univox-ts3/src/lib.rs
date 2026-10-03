@@ -6,9 +6,11 @@
 
 pub mod book;
 pub mod client;
+pub mod ext;
 pub mod query;
 pub mod session;
 
 pub use client::{HandshakeOptions, UdpConnection};
 pub use query::{QueryConnection, QueryOptions, QuerySession};
+pub use ext::{ClientDbEntry, ClientMatch, SelfUpdate, Ts3Ext};
 pub use session::{map_proto_err, self_clid, ts3_capabilities, Ts3Driver, Ts3Session};

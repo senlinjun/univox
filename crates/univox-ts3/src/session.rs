@@ -242,12 +242,12 @@ impl Ts3Session {
         }
     }
 
-    async fn exec(&self, cmd: Command) -> Result<crate::client::Rows> {
+    pub(crate) async fn exec(&self, cmd: Command) -> Result<crate::client::Rows> {
         self.conn().exec(cmd).await.map_err(map_proto_err)
     }
 
     /// Run a command, discarding its response rows.
-    async fn exec_ok(&self, cmd: Command) -> Result<()> {
+    pub(crate) async fn exec_ok(&self, cmd: Command) -> Result<()> {
         self.exec(cmd).await.map(|_| ())
     }
 }

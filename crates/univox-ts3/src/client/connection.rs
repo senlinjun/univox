@@ -369,6 +369,9 @@ struct Actor {
     params: Option<Params>,
     pending: Vec<PendingOut>,
     exec: Option<(u32, oneshot::Sender<Result<Rows>>)>,
+    /// Command name of the pending request — responses may arrive under a
+    /// notification-style name (see `is_response_name`).
+    pending_cmd: Option<String>,
     /// Data rows accumulated for the pending request (multi-row responses
     /// such as `channellist` arrive as separate packets before the `error`).
     pending_rows: Rows,
@@ -440,6 +443,7 @@ async fn run_actor(
         params: None,
         pending: Vec::new(),
         exec: None,
+        pending_cmd: None,
         pending_rows: Rows::new(),
         cur_return_code: 0,
         voice_sink: None,
@@ -1027,6 +1031,7 @@ impl Actor {
         self.cur_return_code += 1;
         let cmd = cmd.param("return_code", code);
         self.pending_rows.clear();
+        self.pending_cmd = Some(cmd.name.clone());
         self.exec = Some((code, reply));
         self.send_command(cmd, false);
     }
@@ -1429,7 +1434,6 @@ impl Actor {
     }
 
     fn dispatch_command(&mut self, shared: &ActorShared, cmd: Command) {
-        tracing::debug!(clid = self.params.as_ref().map(|p| p.c_id).unwrap_or(0), name = %cmd.name, "dispatched");
         // `error` completes the pending request; `notify*` are notifications;
         // everything else while a request is pending is its data rows (the
         // response to `whoami` has no command name at all). Server pushes
@@ -1445,6 +1449,7 @@ impl Actor {
             };
             if matches {
                 if let Some((_, reply)) = self.exec.take() {
+                    self.pending_cmd = None;
                     let id: i32 = cmd.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
                     if id == 0 {
                         let rows = std::mem::take(&mut self.pending_rows);
@@ -1467,13 +1472,18 @@ impl Actor {
             // An error for an already-completed request: ignore.
             return;
         }
-        // While a request is pending, non-notify packets are collected as
-        // its data rows (nameless dumps such as `channellist`) — but they
-        // ALSO flow to the notification channel: server-initiated dumps can
-        // race a request (the login channellist arriving while `whoami` is
-        // in flight) and the bookkeeping pump must not miss them. Mirror
-        // updates from duplicated rows are idempotent.
-        if self.exec.is_some() && !cmd.name.starts_with("notify") {
+        // While a request is pending, its response rows are collected —
+        // but they ALSO flow to the notification channel: mirror updates
+        // from duplicated rows are idempotent, and the pump must not miss
+        // server-initiated dumps that race a request. See
+        // `is_response_name` for the notification-style response names.
+        if self.exec.is_some()
+            && self
+                .pending_cmd
+                .as_deref()
+                .map(|req| is_response_name(&cmd.name, req))
+                .unwrap_or(false)
+        {
             self.pending_rows.extend(cmd.params.clone());
         }
         {
@@ -1485,6 +1495,29 @@ impl Actor {
         }
         let _ = shared.notify_tx.send(cmd);
     }
+}
+
+/// Does `incoming` carry the response rows of a request named `request`?
+///
+/// Most responses arrive nameless or under the request's own name, but the
+/// server answers some commands with a notification-style name
+/// (tsdeclarations Messages.toml): `banlist` -> `notifybanlist`,
+/// `clientdblist` -> `notifyclientdblist`, `complainlist` ->
+/// `notifycomplainlist`, `messagelist` -> `notifymessagelist`, and —
+/// dropping the "get" — `clientgetuidfromclid` -> `notifyclientuidfromclid`,
+/// `messageget` -> `notifymessage`.
+fn is_response_name(incoming: &str, request: &str) -> bool {
+    incoming.is_empty()
+        || incoming == request
+        || incoming == format!("notify{request}")
+        // The ID-mapping notifications drop the "get":
+        // clientgetuidfromclid -> notifyclientuidfromclid etc.
+        || incoming == format!("notify{}", request.replace("get", ""))
+        // messageget answers notifymessage.
+        || (request == "messageget" && incoming == "notifymessage")
+        // clientdbinfo's response starts with the (empty) avatar field,
+        // which the wire parser mistakes for a message name.
+        || (request == "clientdbinfo" && incoming == "client_flag_avatar")
 }
 
 fn header_pid(data: &[u8]) -> u16 {

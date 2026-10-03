@@ -174,6 +174,23 @@ pub fn apply_to_book(
             }
             events
         }
+        "notifyplugincmd" => {
+            let get = |k: &str| cmd.get(k);
+            let member = get("invokerid")
+                .or_else(|| get("clid"))
+                .map(member_id);
+            let target = match get("targetmode").unwrap_or("3") {
+                "1" => univox_core::event::PluginCommandTarget::Single,
+                "2" => univox_core::event::PluginCommandTarget::CurrentTab,
+                "3" => univox_core::event::PluginCommandTarget::Clients,
+                _ => univox_core::event::PluginCommandTarget::All,
+            };
+            vec![Event::PluginCommandReceived {
+                member,
+                payload: get("data").unwrap_or("").as_bytes().to_vec(),
+                target,
+            }]
+        }
         "notifyclientleftview" | "notifyclientdisconnect" => {
             let mut events = Vec::new();
             for row in cmd.rows() {
@@ -242,8 +259,12 @@ pub fn apply_to_book(
                 let member = parse_member(row);
                 book.with_mut(|b| {
                     if let Some(m) = b.members.get_mut(&member.id) {
-                        m.nickname = member.nickname.clone();
-                        m.extra = member.extra.clone();
+                        // Update rows only carry the changed fields — keep
+                        // the known nickname when the row has none.
+                        if !member.nickname.is_empty() {
+                            m.nickname = member.nickname.clone();
+                        }
+                        m.extra.extend(member.extra.clone());
                     }
                     let state = parse_member_state(row);
                     b.member_states.insert(member.id.clone(), state);
