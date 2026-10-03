@@ -12,7 +12,7 @@ use univox_core::error::{Error, Result};
 use univox_core::event::{Event, EventBus, EventStream};
 use univox_core::id::{ChannelId, MemberId, MessageId, SessionId};
 use univox_core::message::MessageContent;
-use univox_core::model::{ChannelOptions, ConnectionStats, MessageTarget};
+use univox_core::model::{ChannelOptions, ConnectionStats, DisconnectReason, MessageTarget};
 use univox_core::session::SessionState;
 use univox_core::session::{Session, SessionCore};
 use univox_core::Book;
@@ -64,14 +64,20 @@ pub fn ts3_capabilities() -> Capabilities {
 }
 
 /// A connected TeamSpeak 3 session (native client protocol).
+///
+/// A supervisor task watches the connection and re-establishes it per the
+/// [`ReconnectPolicy`], restoring channel/mute state (FEATURES.md §2.4).
 pub struct Ts3Session {
     core: Arc<SessionCore>,
-    conn: Arc<UdpConnection>,
-    clid: u16,
+    /// Current connection; swapped by the supervisor on reconnects.
+    conn: std::sync::RwLock<Arc<UdpConnection>>,
+    addr: std::net::SocketAddr,
+    /// Client id assigned by the server; updated on reconnects.
+    clid: std::sync::atomic::AtomicU32,
+    /// Set when the USER closed the session — the supervisor then stops.
+    user_disconnect: std::sync::atomic::AtomicBool,
     /// Kept for reconnects.
-    #[allow(dead_code)]
     connect_options: ConnectOptions,
-    #[allow(dead_code)]
     identity: Identity,
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -92,7 +98,7 @@ impl Ts3Session {
             ..Default::default()
         };
         let (conn, clid) =
-            crate::client::connect(addr, &identity, hs_opts).await.map_err(map_proto_err)?;
+            crate::client::connect(addr, &identity, hs_opts.clone()).await.map_err(map_proto_err)?;
 
         let capabilities = ts3_capabilities();
         let book = Book::new(univox_core::BookConfig {
@@ -105,67 +111,202 @@ impl Ts3Session {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let session = Arc::new(Self {
             core: core.clone(),
-            conn: conn.clone(),
-            clid,
+            conn: std::sync::RwLock::new(conn.clone()),
+            addr,
+            clid: std::sync::atomic::AtomicU32::from(u32::from(clid)),
+            user_disconnect: std::sync::atomic::AtomicBool::new(false),
             connect_options: opts,
             identity,
             shutdown: shutdown_tx,
         });
 
-        // The pump: client-protocol notifications → book + unified events.
-        let pump_core = core.clone();
-        let pump_clid = u64::from(clid);
-        let mut notifications = conn.subscribe();
-        tokio::spawn(async move {
-            let mut rx = shutdown_rx;
-            loop {
-                tokio::select! {
-                    cmd = notifications.recv() => {
-                        let Some(cmd) = cmd else { break };
-                        let events = apply_to_book(&pump_core.book, pump_clid, &cmd, crate::book::StreamOrigin::Client);
-                        for ev in events {
-                            pump_core.bus.send(ev);
-                        }
-                    }
-                    _ = rx.changed() => break,
-                }
-            }
-        });
+        start_pump(&core, &conn, clid, shutdown_rx.clone());
+        prime_book(&core, &conn, clid).await;
 
-        // The server pushes `channellist`, our `notifycliententerview` and
-        // the group lists right after clientinit — the pump mirrors them
-        // into the book. The full client roster is NOT pushed: request it
-        // like the official client does. Some server groups (guests) lack
-        // the view permission for it — ignore that failure; members still
-        // arrive via `notifycliententerview` as they connect.
-        if let Ok(rows) = conn
-            .exec(
-                Command::new("clientlist")
-                    .opt("uid")
-                    .opt("away")
-                    .opt("voice")
-                    .opt("groups"),
-            )
-            .await
-        {
-            let mut dump = Command::new("clientlist");
-            dump.params = rows;
-            for ev in apply_to_book(&core.book, u64::from(clid), &dump, crate::book::StreamOrigin::Client)
-            {
-                core.bus.send(ev);
-            }
-        }
+        // The supervisor: watch for connection loss and reconnect per the
+        // policy, restoring state (FEATURES.md §2.2/§2.4).
+        let sup = session.clone();
+        tokio::spawn(async move {
+            sup.supervise(hs_opts, shutdown_rx).await;
+        });
 
         Ok(session)
     }
 
+    fn conn(&self) -> Arc<UdpConnection> {
+        self.conn.read().unwrap().clone()
+    }
+
+    fn clid(&self) -> u16 {
+        self.clid.load(std::sync::atomic::Ordering::Relaxed) as u16
+    }
+
+    /// Reconnect loop: wait for the connection to die, then re-establish it
+    /// until the policy is exhausted or the user disconnected.
+    async fn supervise(
+        self: Arc<Self>,
+        hs_opts: crate::client::HandshakeOptions,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        loop {
+            let conn = self.conn();
+            tokio::select! {
+                _ = conn.wait_closed() => {}
+                _ = shutdown.changed() => break,
+            }
+            if self.user_disconnect.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+
+            let reason = conn
+                .close_reason()
+                .map(DisconnectReason::Other)
+                .unwrap_or(DisconnectReason::Network("connection lost".into()));
+            self.core.bus.send(Event::TemporarilyDisconnected { reason });
+            // Where we were before the drop, for the state restore.
+            let old_channel = self
+                .core
+                .book
+                .with(|b| b.self_member.channel_id.clone())
+                .unwrap_or(None);
+            // Stale mirror contents (members gone while we were offline).
+            self.core.book.clear();
+            self.core.set_state(SessionState::Reconnecting);
+
+            let policy = &self.connect_options.reconnect;
+            let mut reconnected = None;
+            for attempt in 0..policy.max_attempts {
+                tokio::time::sleep(policy.delay_for(attempt)).await;
+                if *shutdown.borrow() {
+                    break;
+                }
+                // First try keeps the user's identity (server restarts forget
+                // it); later tries use a fresh one — after a network blip the
+                // server briefly rejects the still-registered clone.
+                let attempt_identity = if attempt == 0 {
+                    self.identity.clone()
+                } else {
+                    Identity::create()
+                };
+                match crate::client::spawn_once(self.addr, &attempt_identity, hs_opts.clone())
+                    .await
+                {
+                    Ok(pair) => {
+                        reconnected = Some(pair);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(attempt, error = %e, "reconnect attempt failed");
+                        // The server flood-bans misbehaving clients; back off
+                        // fully before the next attempt in that case.
+                        if e.to_string().contains("flooding") {
+                            tokio::time::sleep(policy.max_delay).await;
+                        }
+                    }
+                }
+            }
+
+            let Some((new_conn, new_clid)) = reconnected else {
+                self.core.state.set(SessionState::Disconnected);
+                self.core.bus.send(Event::Closed {
+                    reason: DisconnectReason::Network(
+                        "reconnect attempts exhausted".into(),
+                    ),
+                });
+                break;
+            };
+
+            *self.conn.write().unwrap() = new_conn.clone();
+            self.clid
+                .store(u32::from(new_clid), std::sync::atomic::Ordering::Relaxed);
+            start_pump(&self.core, &new_conn, new_clid, shutdown.clone());
+            prime_book(&self.core, &new_conn, new_clid).await;
+
+            if policy.restore_state {
+                if let Some(channel) = old_channel {
+                    let _ = new_conn
+                        .exec(
+                            Command::new("clientmove")
+                                .param("clid", new_clid)
+                                .param("cid", channel.as_u64().unwrap_or(0)),
+                        )
+                        .await;
+                }
+            }
+
+            self.core.update_stats(|s| s.reconnect_count += 1);
+            self.core.set_state(SessionState::Connected);
+            // set_state emits the generic Connected event; the resumed
+            // session additionally reports Reconnected (FEATURES.md §2.4).
+            self.core.bus.send(Event::Reconnected);
+        }
+    }
+
     async fn exec(&self, cmd: Command) -> Result<crate::client::Rows> {
-        self.conn.exec(cmd).await.map_err(map_proto_err)
+        self.conn().exec(cmd).await.map_err(map_proto_err)
     }
 
     /// Run a command, discarding its response rows.
     async fn exec_ok(&self, cmd: Command) -> Result<()> {
         self.exec(cmd).await.map(|_| ())
+    }
+}
+
+/// Pump: client-protocol notifications → book mirror + unified events.
+fn start_pump(
+    core: &Arc<SessionCore>,
+    conn: &Arc<UdpConnection>,
+    clid: u16,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let pump_core = core.clone();
+    let pump_clid = u64::from(clid);
+    let mut notifications = conn.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                cmd = notifications.recv() => {
+                    let Some(cmd) = cmd else { break };
+                    let events = apply_to_book(&pump_core.book, pump_clid, &cmd, crate::book::StreamOrigin::Client);
+                    for ev in events {
+                        pump_core.bus.send(ev);
+                    }
+                }
+                _ = shutdown.changed() => break,
+            }
+        }
+    });
+}
+
+/// Fill the book from a full-sync dump (no events — initial state, not a
+/// transition).
+fn apply_dump(core: &SessionCore, name: &str, rows: crate::client::Rows, clid: u16) {
+    let mut dump = Command::new(name);
+    dump.params = rows;
+    for ev in apply_to_book(&core.book, u64::from(clid), &dump, crate::book::StreamOrigin::Client) {
+        core.bus.send(ev);
+    }
+}
+
+/// Request the full client roster once, like the official client does (the
+/// server pushes `channellist` by itself, but not `clientlist`). Some server
+/// groups (guests) lack the view permission — ignore that failure; members
+/// still arrive via `notifycliententerview` as they connect.
+async fn prime_book(core: &Arc<SessionCore>, conn: &Arc<UdpConnection>, clid: u16) {
+    if !core.book.enabled() {
+        return;
+    }
+    if let Ok(rows) = conn
+        .exec(
+            Command::new("clientlist")
+                .opt("uid")
+                .opt("away")
+                .opt("voice")
+                .opt("groups"),
+        )
+        .await
+    {
+        apply_dump(core, "clientlist", rows, clid);
     }
 }
 
@@ -204,12 +345,16 @@ impl Session for Ts3Session {
     }
 
     fn stats(&self) -> ConnectionStats {
-        self.core.stats.read().unwrap().clone()
+        let mut s = self.conn().stats_snapshot();
+        s.reconnect_count = self.core.stats.read().unwrap().reconnect_count;
+        s
     }
 
     async fn disconnect(&self, message: Option<String>) -> Result<()> {
+        self.user_disconnect
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.core.set_state(SessionState::Disconnected);
-        self.conn
+        self.conn()
             .disconnect(1, message.as_deref().unwrap_or("disconnecting"));
         let _ = self.shutdown.send(true);
         Ok(())
@@ -242,7 +387,7 @@ impl Session for Ts3Session {
     }
 
     async fn join_voice(&self, channel: &ChannelId, _password: Option<&str>) -> Result<()> {
-        self.move_member(&MemberId::from_u64(u64::from(self.clid)), channel)
+        self.move_member(&MemberId::from_u64(u64::from(self.clid())), channel)
             .await
     }
 
@@ -420,5 +565,5 @@ impl univox_core::session::Driver for Ts3Driver {
 
 /// The client id assigned to this session by the server.
 pub fn self_clid(session: &Ts3Session) -> u64 {
-    u64::from(session.clid)
+    u64::from(session.clid())
 }

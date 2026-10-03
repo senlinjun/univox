@@ -44,6 +44,9 @@ pub struct Ts3ServerOptions {
     pub server_dir: Option<PathBuf>,
     /// Require the ServerAdmin privilege key to be present.
     pub require_token: bool,
+    /// Bind the voice server to this fixed UDP port instead of a random one
+    /// (for reconnect tests that restart the server on the same endpoint).
+    pub voice_port: Option<u16>,
 }
 
 /// A running local TS3 server instance. Killing it on drop.
@@ -100,7 +103,10 @@ impl Ts3Server {
             .map_err(|e| e.to_string())?;
         drop(allow);
 
-        let voice_port = free_udp_port().map_err(|e| e.to_string())?;
+        let voice_port = match opts.voice_port {
+            Some(p) => p,
+            None => free_udp_port().map_err(|e| e.to_string())?,
+        };
         let filetransfer_port = free_tcp_port().map_err(|e| e.to_string())?;
         let query_port = free_tcp_port().map_err(|e| e.to_string())?;
         let query_ssh_port = free_tcp_port().map_err(|e| e.to_string())?;

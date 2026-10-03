@@ -91,6 +91,23 @@ struct PendingOut {
     resends: u32,
 }
 
+/// Raw counters collected by the actor; surfaced as [`ConnectionStats`].
+#[derive(Default)]
+pub(crate) struct RawStats {
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub packets_up: u64,
+    pub packets_down: u64,
+    /// Command packets we had to resend (approximate packet loss).
+    pub resends: u64,
+    /// When we last sent our own ping (for RTT on the matching pong).
+    pub last_ping_sent: Option<Instant>,
+    pub ping: Option<Duration>,
+}
+
+/// Why the connection ended (set by the actor before it exits).
+pub(crate) type CloseReason = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
 enum Request {
     Exec {
         cmd: Command,
@@ -146,6 +163,8 @@ pub struct UdpConnection {
     replay: std::sync::Arc<std::sync::Mutex<VecDeque<Command>>>,
     voice_tx: broadcast::Sender<VoiceData>,
     closed: std::sync::Arc<tokio::sync::watch::Receiver<bool>>,
+    stats: std::sync::Arc<std::sync::Mutex<RawStats>>,
+    close_reason: CloseReason,
 }
 
 const REPLAY_CAPACITY: usize = 128;
@@ -163,8 +182,10 @@ impl UdpConnection {
         let (voice_tx, _) = broadcast::channel(256);
         let (req_tx, req_rx) = mpsc::channel(128);
         let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
-        let (done_tx, done_rx): (oneshot::Sender<Result<HandshakeResult>>, _) = oneshot::channel();
+        let (done_tx, mut done_rx): (oneshot::Sender<Result<HandshakeResult>>, _) = oneshot::channel();
         let replay: std::sync::Arc<std::sync::Mutex<VecDeque<Command>>> = Default::default();
+        let stats: std::sync::Arc<std::sync::Mutex<RawStats>> = Default::default();
+        let close_reason: CloseReason = Default::default();
 
         tokio::spawn(run_actor(
             sock,
@@ -177,6 +198,8 @@ impl UdpConnection {
             voice_tx.clone(),
             closed_tx,
             done_tx,
+            stats.clone(),
+            close_reason.clone(),
         ));
 
         // Wait for the handshake result.
@@ -190,6 +213,8 @@ impl UdpConnection {
                     replay,
                     voice_tx,
                     closed: std::sync::Arc::new(closed_rx),
+                    stats,
+                    close_reason,
                 };
                 Ok(conn)
             }
@@ -214,6 +239,36 @@ impl UdpConnection {
 
     pub fn is_closed(&self) -> bool {
         *self.closed.borrow()
+    }
+
+    /// Resolves once the connection is down (server loss, timeout, error).
+    pub async fn wait_closed(&self) {
+        let mut rx = (*self.closed).clone();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }    /// Why the actor gave up, if it did (lifecycle/reconnect reporting).
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason.lock().unwrap().clone()
+    }
+
+    /// Traffic snapshot of this connection (FEATURES.md §2.5). The
+    /// `reconnect_count` field is 0 here; the session layer adds it.
+    pub fn stats_snapshot(&self) -> univox_core::model::ConnectionStats {
+        let s = self.stats.lock().unwrap();
+        univox_core::model::ConnectionStats {
+            ping: s.ping,
+            packet_loss: if s.packets_up > 0 {
+                s.resends as f32 / s.packets_up as f32
+            } else {
+                0.0
+            },
+            bandwidth_up: s.bytes_up,
+            bandwidth_down: s.bytes_down,
+            reconnect_count: 0,
+        }
     }
 
     pub async fn exec(&self, cmd: Command) -> Result<Rows> {
@@ -321,6 +376,8 @@ struct Actor {
     voice_sink: Option<broadcast::Sender<VoiceData>>,
     last_packet: Instant,
     last_ping: Instant,
+    stats: std::sync::Arc<std::sync::Mutex<RawStats>>,
+    close_reason: CloseReason,
 }
 
 struct ActorShared {
@@ -341,6 +398,8 @@ async fn run_actor(
     voice_tx: broadcast::Sender<VoiceData>,
     closed_tx: tokio::sync::watch::Sender<bool>,
     done_tx: oneshot::Sender<Result<HandshakeResult>>,
+    stats: std::sync::Arc<std::sync::Mutex<RawStats>>,
+    close_reason: CloseReason,
 ) {
     let sock = std::sync::Arc::new(sock);
     let (udp_tx, mut udp_rx) = mpsc::channel::<Vec<u8>>(512);
@@ -349,13 +408,20 @@ async fn run_actor(
         tokio::spawn(async move {
             let mut buf = vec![0u8; proto::MAX_UDP_PACKET_LENGTH + 64];
             loop {
-                match sock.recv_from(&mut buf).await {
-                    Ok((n, _)) => {
-                        if udp_tx.send(buf[..n].to_vec()).await.is_err() {
-                            break;
+                // Exit when the actor is gone, even if no datagrams arrive
+                // (a dead server produces none) — don't leak the socket.
+                tokio::select! {
+                    r = sock.recv_from(&mut buf) => {
+                        match r {
+                            Ok((n, _)) => {
+                                if udp_tx.send(buf[..n].to_vec()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
-                    Err(_) => break,
+                    _ = udp_tx.closed() => break,
                 }
             }
         });
@@ -379,6 +445,8 @@ async fn run_actor(
         voice_sink: None,
         last_packet: Instant::now(),
         last_ping: Instant::now(),
+        stats: stats.clone(),
+        close_reason: close_reason.clone(),
     };
 
     // ---- Phase 1: handshake ----
@@ -393,13 +461,13 @@ async fn run_actor(
     // ---- Phase 2: normal operation ----
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
+    let reason = loop {
         tokio::select! {
             biased;
             datagram = udp_rx.recv() => {
                 match datagram {
                     Some(d) => actor.handle_udp(&shared, d),
-                    None => break,
+                    None => break "socket closed".to_string(),
                 }
             }
             req = req_rx.recv() => {
@@ -415,16 +483,17 @@ async fn run_actor(
                             .param("reasonmsg", reasonmsg);
                         actor.send_command(cmd, false);
                     }
-                    None => break,
+                    None => break "request channel closed".to_string(),
                 }
             }
             _ = tick.tick() => {
-                if actor.maintenance().is_err() {
-                    break;
+                if let Err(e) = actor.maintenance() {
+                    break e.to_string();
                 }
             }
         }
-    }
+    };
+    *actor.close_reason.lock().unwrap() = Some(reason);
     let _ = shared.closed_tx.send(true);
 }
 
@@ -1047,6 +1116,10 @@ impl Actor {
     }
 
     fn send_udp(&mut self, raw: Vec<u8>) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.bytes_up += raw.len() as u64;
+            s.packets_up += 1;
+        }
         let _ = self.sock.try_send_to(&raw, self.addr);
     }
 
@@ -1076,6 +1149,9 @@ impl Actor {
                 p.resends += 1;
                 to_send.extend(p.datagrams.iter().cloned());
                 p.last_sent = now;
+                if let Ok(mut s) = self.stats.lock() {
+                    s.resends += 1;
+                }
             }
             if p.resends >= 12 {
                 give_up = true;
@@ -1107,6 +1183,9 @@ impl Actor {
                 &[],
             );
             self.mark_unencrypted(&mut raw);
+            if let Ok(mut s) = self.stats.lock() {
+                s.last_ping_sent = Some(now);
+            }
             self.send_udp(raw);
         }
         Ok(())
@@ -1114,6 +1193,10 @@ impl Actor {
 
     fn handle_udp(&mut self, shared: &ActorShared, mut data: Vec<u8>) {
         self.last_packet = Instant::now();
+        if let Ok(mut s) = self.stats.lock() {
+            s.bytes_down += data.len() as u64;
+            s.packets_down += 1;
+        }
         let Ok(header) = Header::new(Direction::S2C, &data) else {
             return;
         };
@@ -1121,6 +1204,13 @@ impl Actor {
             return;
         };
         let p_id = header.packet_id();
+        if p_type == PacketType::Pong {
+            if let Ok(mut s) = self.stats.lock() {
+                if let Some(sent) = s.last_ping_sent {
+                    s.ping = Some(sent.elapsed());
+                }
+            }
+        }
 
         match p_type {
             PacketType::Init => {}
@@ -1377,14 +1467,14 @@ impl Actor {
             // An error for an already-completed request: ignore.
             return;
         }
-        // While a request is pending, non-notify packets are its data rows
-        // (nameless dumps such as `channellist`). Everything else — server
-        // pushes (`notify*`) and dumps without a pending request — flows
-        // through the notification channel; the session layer feeds them
-        // into the bookkeeping mirror (FEATURES.md §4).
+        // While a request is pending, non-notify packets are collected as
+        // its data rows (nameless dumps such as `channellist`) — but they
+        // ALSO flow to the notification channel: server-initiated dumps can
+        // race a request (the login channellist arriving while `whoami` is
+        // in flight) and the bookkeeping pump must not miss them. Mirror
+        // updates from duplicated rows are idempotent.
         if self.exec.is_some() && !cmd.name.starts_with("notify") {
-            self.pending_rows.extend(cmd.params);
-            return;
+            self.pending_rows.extend(cmd.params.clone());
         }
         {
             let mut replay = shared.replay.lock().unwrap();
