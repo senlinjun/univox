@@ -1081,6 +1081,7 @@ dependencies = [
 name = "univox-ts3"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "bytes",
  "curve25519-dalek",

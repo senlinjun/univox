@@ -20,6 +20,7 @@ rand.workspace = true
 num-bigint-dig.workspace = true
 quicklz = "0.3"
 curve25519-dalek.workspace = true
+async-trait = "0.1"
 
 [dev-dependencies]
 test-support.workspace = true

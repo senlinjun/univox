@@ -67,10 +67,19 @@ pub struct NetworkConfig {
 }
 
 /// Bookkeeping scope (FEATURES.md §4, "可关闭").
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Defaults to enabled — the mirror is a core feature users opt *out* of
+/// (consistent with [`crate::bookkeeping::BookConfig::default`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BookkeepingConfig {
     pub enabled: bool,
     pub member_states: bool,
+}
+
+impl Default for BookkeepingConfig {
+    fn default() -> Self {
+        Self { enabled: true, member_states: true }
+    }
 }
 
 /// Initial member state after connecting (FEATURES.md §2.1).
@@ -136,6 +145,12 @@ impl ConnectOptions {
 
     pub fn initial_channel(mut self, c: InitialChannel) -> Self {
         self.initial_channel = Some(c);
+        self
+    }
+
+    /// Configure the bookkeeping mirror (FEATURES.md §4).
+    pub fn bookkeeping(mut self, cfg: BookkeepingConfig) -> Self {
+        self.bookkeeping = cfg;
         self
     }
 

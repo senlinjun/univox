@@ -2,7 +2,7 @@
 
 pub mod connection;
 
-pub use connection::{HandshakeOptions, UdpConnection};
+pub use connection::{HandshakeOptions, Rows, UdpConnection};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,7 +49,10 @@ pub async fn connect(
         )
         .await
         {
-            Ok(conn) => return Ok((Arc::new(conn), 0)),
+            Ok(conn) => {
+                let clid = conn.clid;
+                return Ok((Arc::new(conn), clid));
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "client handshake attempt failed, retrying");
                 last_err = Some(e);

@@ -1,0 +1,424 @@
+//! The unified [`Ts3Session`]: wires the native client connection into the
+//! core abstractions (book mirror, event bus, Session trait, G1/G2/G3).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::sync::broadcast;
+
+use univox_core::connect::{Capabilities, ConnectOptions};
+use univox_core::error::{Error, Result};
+use univox_core::event::{Event, EventBus, EventStream};
+use univox_core::id::{ChannelId, MemberId, MessageId, SessionId};
+use univox_core::message::MessageContent;
+use univox_core::model::{ChannelOptions, ConnectionStats, MessageTarget};
+use univox_core::session::SessionState;
+use univox_core::session::{Session, SessionCore};
+use univox_core::Book;
+use univox_ts3_proto::{Command, Error as T3Error, Identity, RowExt};
+
+use crate::book::apply_to_book;
+use crate::client::UdpConnection;
+
+/// Map a protocol error into the unified error type.
+pub fn map_proto_err(e: T3Error) -> Error {
+    match e {
+        T3Error::Server { id, msg, extra } => {
+            if id == univox_ts3_proto::error::ids::PERMISSIONS_CLIENT_INSUFFICIENT {
+                let missing = extra
+                    .iter()
+                    .find(|(k, _)| k == "failed_permid")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                Error::Permission { missing }
+            } else {
+                Error::Platform {
+                    platform: univox_core::platform::Platform::Ts3,
+                    code: id,
+                    message: msg,
+                }
+            }
+        }
+        other => Error::Other(other.to_string()),
+    }
+}
+
+/// Capability set of the TS3 client driver.
+pub fn ts3_capabilities() -> Capabilities {
+    Capabilities {
+        platform: univox_core::platform::Platform::Ts3,
+        audio: univox_core::audio::AudioCapability::FullDuplex,
+        message_history: false,
+        message_edit: false,
+        message_delete: false,
+        reactions: false,
+        mentions: false,
+        channel_management: true,
+        server_management: true,
+        role_management: true,
+        file_transfer: true,
+        kicks: true,
+        bans: true,
+    }
+}
+
+/// A connected TeamSpeak 3 session (native client protocol).
+pub struct Ts3Session {
+    core: Arc<SessionCore>,
+    conn: Arc<UdpConnection>,
+    clid: u16,
+    /// Kept for reconnects.
+    #[allow(dead_code)]
+    connect_options: ConnectOptions,
+    #[allow(dead_code)]
+    identity: Identity,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl Ts3Session {
+    /// Connect a new session and start the bookkeeping pump.
+    pub async fn connect(opts: ConnectOptions, identity: Identity) -> Result<Arc<Self>> {
+        let addr = opts
+            .address
+            .parse()
+            .map_err(|_| Error::InvalidArgument(format!("bad address {}", opts.address)))?;
+        let nickname = opts.nickname.clone().unwrap_or_else(|| "UnivoxBot".into());
+        let hs_opts = crate::client::HandshakeOptions {
+            nickname,
+            client_key_offset: identity.counter(),
+            input_muted: opts.initial_state.input_muted,
+            output_muted: opts.initial_state.output_muted,
+            ..Default::default()
+        };
+        let (conn, clid) =
+            crate::client::connect(addr, &identity, hs_opts).await.map_err(map_proto_err)?;
+
+        let capabilities = ts3_capabilities();
+        let book = Book::new(univox_core::BookConfig {
+            enabled: opts.bookkeeping.enabled,
+            member_states: opts.bookkeeping.member_states,
+        });
+        let core = Arc::new(SessionCore::new(capabilities, book));
+        core.set_state(SessionState::Connected);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let session = Arc::new(Self {
+            core: core.clone(),
+            conn: conn.clone(),
+            clid,
+            connect_options: opts,
+            identity,
+            shutdown: shutdown_tx,
+        });
+
+        // The pump: client-protocol notifications → book + unified events.
+        let pump_core = core.clone();
+        let pump_clid = u64::from(clid);
+        let mut notifications = conn.subscribe();
+        tokio::spawn(async move {
+            let mut rx = shutdown_rx;
+            loop {
+                tokio::select! {
+                    cmd = notifications.recv() => {
+                        let Some(cmd) = cmd else { break };
+                        let events = apply_to_book(&pump_core.book, pump_clid, &cmd, crate::book::StreamOrigin::Client);
+                        for ev in events {
+                            pump_core.bus.send(ev);
+                        }
+                    }
+                    _ = rx.changed() => break,
+                }
+            }
+        });
+
+        // The server pushes `channellist`, our `notifycliententerview` and
+        // the group lists right after clientinit — the pump mirrors them
+        // into the book. The full client roster is NOT pushed: request it
+        // like the official client does. Some server groups (guests) lack
+        // the view permission for it — ignore that failure; members still
+        // arrive via `notifycliententerview` as they connect.
+        if let Ok(rows) = conn
+            .exec(
+                Command::new("clientlist")
+                    .opt("uid")
+                    .opt("away")
+                    .opt("voice")
+                    .opt("groups"),
+            )
+            .await
+        {
+            let mut dump = Command::new("clientlist");
+            dump.params = rows;
+            for ev in apply_to_book(&core.book, u64::from(clid), &dump, crate::book::StreamOrigin::Client)
+            {
+                core.bus.send(ev);
+            }
+        }
+
+        Ok(session)
+    }
+
+    async fn exec(&self, cmd: Command) -> Result<crate::client::Rows> {
+        self.conn.exec(cmd).await.map_err(map_proto_err)
+    }
+
+    /// Run a command, discarding its response rows.
+    async fn exec_ok(&self, cmd: Command) -> Result<()> {
+        self.exec(cmd).await.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl Session for Ts3Session {
+    fn id(&self) -> &SessionId {
+        &self.core.id
+    }
+
+    fn platform(&self) -> univox_core::platform::Platform {
+        univox_core::platform::Platform::Ts3
+    }
+
+    fn state(&self) -> SessionState {
+        self.core.state.get()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.core.capabilities
+    }
+
+    fn tag(&self) -> Option<String> {
+        self.core.tag.read().unwrap().clone()
+    }
+
+    fn set_tag(&self, tag: Option<String>) {
+        *self.core.tag.write().unwrap() = tag;
+    }
+
+    fn events(&self) -> EventStream {
+        self.core.bus.subscribe_all()
+    }
+
+    fn book(&self) -> Book {
+        self.core.book.clone()
+    }
+
+    fn stats(&self) -> ConnectionStats {
+        self.core.stats.read().unwrap().clone()
+    }
+
+    async fn disconnect(&self, message: Option<String>) -> Result<()> {
+        self.core.set_state(SessionState::Disconnected);
+        self.conn
+            .disconnect(1, message.as_deref().unwrap_or("disconnecting"));
+        let _ = self.shutdown.send(true);
+        Ok(())
+    }
+
+    async fn send_message(
+        &self,
+        target: MessageTarget,
+        content: &MessageContent,
+    ) -> Result<MessageId> {
+        let text = content.plain_text();
+        let cmd = crate::book::sendtextmessage_command(&target, &text).map_err(map_proto_err)?;
+        self.exec(cmd).await?;
+        Ok(MessageId::from_string(format!(
+            "ts3-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )))
+    }
+
+    async fn poke(&self, member: &MemberId, message: &str) -> Result<()> {
+        self.exec_ok(
+            Command::new("clientpoke")
+                .param("clid", member.as_u64().unwrap_or(0))
+                .param("msg", message),
+        )
+        .await
+    }
+
+    async fn join_voice(&self, channel: &ChannelId, _password: Option<&str>) -> Result<()> {
+        self.move_member(&MemberId::from_u64(u64::from(self.clid)), channel)
+            .await
+    }
+
+    async fn leave_voice(&self) -> Result<()> {
+        Err(Error::Unsupported(
+            "TS3 clients always remain in a channel".into(),
+        ))
+    }
+
+    async fn create_channel(&self, options: ChannelOptions) -> Result<ChannelId> {
+        let mut cmd = Command::new("channelcreate").param("channel_name", &options.name);
+        if let Some(parent) = &options.parent {
+            cmd = cmd.param("cpid", parent.as_u64().unwrap_or(0));
+        }
+        match options.permanence {
+            univox_core::model::Permanence::Permanent => {
+                cmd = cmd.param("channel_flag_permanent", 1);
+            }
+            univox_core::model::Permanence::SemiPermanent => {
+                cmd = cmd.param("channel_flag_semi_permanent", 1);
+            }
+            univox_core::model::Permanence::Temporary => {
+                cmd = cmd.param("channel_flag_temporary", 1);
+            }
+        }
+        if let Some(limit) = options.user_limit {
+            cmd = cmd.param("channel_maxclients", limit);
+        }
+        if options.default_channel {
+            cmd = cmd.param("channel_flag_default", 1);
+        }
+        if let Some(pw) = &options.password {
+            cmd = cmd.param("channel_password", pw);
+        }
+        let rows = self.exec(cmd).await?;
+        // The server sends no data row for channelcreate; it announces the
+        // channel to us (and everyone) via `notifychannelcreated`, which the
+        // pump mirrors into the book. Wait for that mirror (bounded).
+        let mut cid = rows
+            .first()
+            .and_then(|r| r.get("cid"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while cid.is_none() && tokio::time::Instant::now() < deadline {
+            cid = self
+                .book()
+                .channels()
+                .iter()
+                .filter(|c| c.name == options.name)
+                .map(|c| c.id.as_u64().unwrap_or(0))
+                .max()
+                .filter(|v| *v > 0);
+            if cid.is_none() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        let cid = cid.ok_or_else(|| Error::Other("channelcreate: no cid".into()))?;
+        Ok(ChannelId::from_u64(cid))
+    }
+
+    async fn edit_channel(&self, id: &ChannelId, options: ChannelOptions) -> Result<()> {
+        let mut cmd = Command::new("channeledit").param("cid", id.as_u64().unwrap_or(0));
+        if !options.name.is_empty() {
+            cmd = cmd.param("channel_name", &options.name);
+        }
+        if let Some(topic) = &options.topic {
+            cmd = cmd.param("channel_topic", topic);
+        }
+        if let Some(desc) = &options.description {
+            cmd = cmd.param("channel_description", desc);
+        }
+        if let Some(limit) = options.user_limit {
+            cmd = cmd.param("channel_maxclients", limit);
+        }
+        self.exec_ok(cmd).await
+    }
+
+    async fn delete_channel(&self, id: &ChannelId, force: bool) -> Result<()> {
+        self.exec_ok(
+            Command::new("channeldelete")
+                .param("cid", id.as_u64().unwrap_or(0))
+                .param("force", u8::from(force)),
+        )
+        .await
+    }
+
+    async fn move_member(&self, member: &MemberId, channel: &ChannelId) -> Result<()> {
+        self.exec_ok(
+            Command::new("clientmove")
+                .param("clid", member.as_u64().unwrap_or(0))
+                .param("cid", channel.as_u64().unwrap_or(0)),
+        )
+        .await
+    }
+
+    async fn kick_member(
+        &self,
+        member: &MemberId,
+        from_channel: bool,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let mut cmd = Command::new("clientkick")
+            .param("clid", member.as_u64().unwrap_or(0))
+            .param("reasonid", u8::from(!from_channel) + 4);
+        if let Some(r) = reason {
+            cmd = cmd.param("reasonmsg", r);
+        }
+        self.exec_ok(cmd).await
+    }
+
+    async fn ban_member(
+        &self,
+        member: &MemberId,
+        duration: Option<Duration>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        // Ban by the member's current identity data via banclient.
+        let mut cmd = Command::new("banclient").param("clid", member.as_u64().unwrap_or(0));
+        if let Some(d) = duration {
+            cmd = cmd.param("time", d.as_secs());
+        }
+        if let Some(r) = reason {
+            cmd = cmd.param("banreason", r);
+        }
+        self.exec_ok(cmd).await
+    }
+
+    async fn assign_role(&self, member: &MemberId, role: &univox_core::id::RoleId) -> Result<()> {
+        self.exec_ok(
+            Command::new("servergroupaddclient")
+                .param("sgid", role.as_u64().unwrap_or(0))
+                .param("cldbid", member.as_u64().unwrap_or(0)),
+        )
+        .await
+    }
+
+    async fn revoke_role(&self, member: &MemberId, role: &univox_core::id::RoleId) -> Result<()> {
+        self.exec_ok(
+            Command::new("servergroupdelclient")
+                .param("sgid", role.as_u64().unwrap_or(0))
+                .param("cldbid", member.as_u64().unwrap_or(0)),
+        )
+        .await
+    }
+
+    async fn use_privilege_key(&self, token: &str) -> Result<()> {
+        self.exec_ok(Command::new("privilegekeyuse").param("token", token)).await
+    }
+}
+
+/// The TS3 driver (G1): creates client-protocol sessions.
+pub struct Ts3Driver;
+
+#[async_trait]
+impl univox_core::session::Driver for Ts3Driver {
+    fn platform(&self) -> univox_core::platform::Platform {
+        univox_core::platform::Platform::Ts3
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        ts3_capabilities()
+    }
+
+    async fn connect(&self, opts: ConnectOptions) -> Result<Arc<dyn Session>> {
+        let identity = match &opts.credential {
+            Some(univox_core::credential::Credential::Ts3Identity { identity }) => {
+                Identity::parse(identity).map_err(map_proto_err)?
+            }
+            _ => Identity::create(),
+        };
+        Ts3Session::connect(opts, identity).await.map(|s| s as Arc<dyn Session>)
+    }
+}
+
+/// The client id assigned to this session by the server.
+pub fn self_clid(session: &Ts3Session) -> u64 {
+    u64::from(session.clid)
+}

@@ -94,7 +94,7 @@ struct PendingOut {
 enum Request {
     Exec {
         cmd: Command,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<Rows>>,
     },
     SendVoice {
         content: Vec<u8>,
@@ -109,6 +109,7 @@ enum Request {
     },
 }
 
+/// Response rows of a command (`channellist` etc. may return many rows).
 pub type Rows = Vec<Vec<(String, String)>>;
 
 /// Notification stream: replays buffered notifications, then goes live.
@@ -135,6 +136,8 @@ impl NotificationStream {
 /// Handle to the connected client actor.
 pub struct UdpConnection {
     pub addr: SocketAddr,
+    /// The client id assigned by the server (from initserver `aclid`).
+    pub clid: u16,
     tx: mpsc::Sender<Request>,
     notify_tx: broadcast::Sender<Command>,
     /// Notifications that arrived before the first `subscribe` — the login
@@ -179,17 +182,15 @@ impl UdpConnection {
         // Wait for the handshake result.
         match tokio::time::timeout(Duration::from_secs(15), done_rx).await {
             Ok(Ok(Ok(handshake))) => {
-                // Push the params into the actor's request channel.
                 let conn = Self {
                     addr,
+                    clid: handshake.clid,
                     tx: req_tx,
                     notify_tx,
                     replay,
                     voice_tx,
                     closed: std::sync::Arc::new(closed_rx),
                 };
-                // The actor already stored its own params; nothing to send.
-                let _ = handshake;
                 Ok(conn)
             }
             Ok(Ok(Err(e))) => Err(e),
@@ -215,7 +216,7 @@ impl UdpConnection {
         *self.closed.borrow()
     }
 
-    pub async fn exec(&self, cmd: Command) -> Result<()> {
+    pub async fn exec(&self, cmd: Command) -> Result<Rows> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Request::Exec { cmd, reply: reply_tx })
@@ -312,7 +313,10 @@ struct Actor {
     codec: Codec,
     params: Option<Params>,
     pending: Vec<PendingOut>,
-    exec: Option<(u32, oneshot::Sender<Result<()>>)>,
+    exec: Option<(u32, oneshot::Sender<Result<Rows>>)>,
+    /// Data rows accumulated for the pending request (multi-row responses
+    /// such as `channellist` arrive as separate packets before the `error`).
+    pending_rows: Rows,
     cur_return_code: u32,
     voice_sink: Option<broadcast::Sender<VoiceData>>,
     last_packet: Instant,
@@ -370,6 +374,7 @@ async fn run_actor(
         params: None,
         pending: Vec::new(),
         exec: None,
+        pending_rows: Rows::new(),
         cur_return_code: 0,
         voice_sink: None,
         last_packet: Instant::now(),
@@ -731,6 +736,17 @@ impl Actor {
                         match cmd.name.as_str() {
                             "initserver" => {
                                 self.remove_pending(PacketType::Command, 2);
+                                // The session pump mirrors server info and
+                                // the self member from initserver — forward
+                                // it like any other login dump.
+                                {
+                                    let mut replay = shared.replay.lock().unwrap();
+                                    if replay.len() >= REPLAY_CAPACITY {
+                                        replay.pop_front();
+                                    }
+                                    replay.push_back(cmd.clone());
+                                }
+                                let _ = shared.notify_tx.send(cmd.clone());
                                 initserver = Some(cmd);
                                 break;
                             }
@@ -931,16 +947,17 @@ impl Actor {
 
     // ---- normal operation ----
 
-    fn exec(&mut self, cmd: Command, reply: oneshot::Sender<Result<()>>) {
+    fn exec(&mut self, cmd: Command, reply: oneshot::Sender<Result<Rows>>) {
         if self.exec.is_some() {
             let _ = reply.send(Err(Error::Other("concurrent client command".into())));
             return;
         }
         // The server echoes `return_code` in the error packet that completes
-        // this command; data rows are forwarded on the notification channel.
+        // this command; data rows are collected into `pending_rows`.
         let code = self.cur_return_code;
         self.cur_return_code += 1;
         let cmd = cmd.param("return_code", code);
+        self.pending_rows.clear();
         self.exec = Some((code, reply));
         self.send_command(cmd, false);
     }
@@ -1340,7 +1357,8 @@ impl Actor {
                 if let Some((_, reply)) = self.exec.take() {
                     let id: i32 = cmd.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
                     if id == 0 {
-                        let _ = reply.send(Ok(()));
+                        let rows = std::mem::take(&mut self.pending_rows);
+                        let _ = reply.send(Ok(rows));
                     } else {
                         let msg = cmd.get("msg").unwrap_or("").to_string();
                         let extra = cmd
@@ -1359,9 +1377,15 @@ impl Actor {
             // An error for an already-completed request: ignore.
             return;
         }
-        // Data rows and server pushes (channellist dumps, notifications) all
-        // flow through the notification channel; the session layer feeds
-        // them into the bookkeeping mirror (FEATURES.md §4).
+        // While a request is pending, non-notify packets are its data rows
+        // (nameless dumps such as `channellist`). Everything else — server
+        // pushes (`notify*`) and dumps without a pending request — flows
+        // through the notification channel; the session layer feeds them
+        // into the bookkeeping mirror (FEATURES.md §4).
+        if self.exec.is_some() && !cmd.name.starts_with("notify") {
+            self.pending_rows.extend(cmd.params);
+            return;
+        }
         {
             let mut replay = shared.replay.lock().unwrap();
             if replay.len() >= REPLAY_CAPACITY {
