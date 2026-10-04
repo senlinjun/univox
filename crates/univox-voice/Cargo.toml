@@ -7,7 +7,10 @@ license.workspace = true
 
 [dependencies]
 univox-core.workspace = true
+univox-ts3-proto.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true
+audiopus.workspace = true
+async-trait.workspace = true

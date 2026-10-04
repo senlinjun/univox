@@ -143,6 +143,14 @@ pub trait Ts3Ext: Session {
 
     async fn update_self(&self, update: SelfUpdate) -> Result<()>;
 
+    // ---- whisper (§6.5) ----
+
+    /// Whisper one Opus frame (20 ms) to every client inside `channel`.
+    /// Verified on server 3.13.8 with the new whisper protocol:
+    /// whisper_type=1, target=0, target_id=channel id. Client-targeted
+    /// whispering needs the whisper-list machinery (not yet implemented).
+    async fn send_whisper_to_channel(&self, channel: &univox_core::id::ChannelId, frame: &[u8]) -> Result<()>;
+
     // ---- plugin command relay (§11) ----
 
     /// `plugincmd` — relay a plugin message to other clients. The wire
@@ -431,6 +439,24 @@ impl Ts3Ext for Ts3Session {
 
     async fn update_self(&self, update: SelfUpdate) -> Result<()> {
         self.exec_ok(update.into_command()).await
+    }
+
+    async fn send_whisper_to_channel(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        frame: &[u8],
+    ) -> Result<()> {
+        // New whisper format: [codec][whisper_type][target][target_id:8]
+        // [opus data]; whisper_type 1 targets a channel. The connection
+        // prepends the voice sequence id.
+        let mut content = Vec::with_capacity(11 + frame.len());
+        content.push(univox_voice::CODEC_OPUS_VOICE);
+        content.push(1); // whisper_type: channel
+        content.push(0); // target
+        content.extend_from_slice(&channel.as_u64().unwrap_or(0).to_be_bytes());
+        content.extend_from_slice(frame);
+        self.conn().send_voice(content, univox_ts3_proto::PacketType::VoiceWhisper).await;
+        Ok(())
     }
 
     async fn send_plugin_command(

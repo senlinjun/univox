@@ -76,6 +76,10 @@ pub struct Ts3Session {
     clid: std::sync::atomic::AtomicU32,
     /// Set when the USER closed the session — the supervisor then stops.
     user_disconnect: std::sync::atomic::AtomicBool,
+    /// Active voice send task (FEATURES.md §6.2).
+    sending: std::sync::Mutex<Option<VoiceTask>>,
+    /// Active voice receive tasks (FEATURES.md §6.3).
+    receiving: std::sync::Mutex<Option<VoiceTask>>,
     /// Kept for reconnects.
     connect_options: ConnectOptions,
     identity: Identity,
@@ -115,6 +119,8 @@ impl Ts3Session {
             addr,
             clid: std::sync::atomic::AtomicU32::from(u32::from(clid)),
             user_disconnect: std::sync::atomic::AtomicBool::new(false),
+            sending: std::sync::Mutex::new(None),
+            receiving: std::sync::Mutex::new(None),
             connect_options: opts,
             identity,
             shutdown: shutdown_tx,
@@ -133,7 +139,7 @@ impl Ts3Session {
         Ok(session)
     }
 
-    fn conn(&self) -> Arc<UdpConnection> {
+    pub fn conn(&self) -> Arc<UdpConnection> {
         self.conn.read().unwrap().clone()
     }
 
@@ -242,7 +248,8 @@ impl Ts3Session {
         }
     }
 
-    pub(crate) async fn exec(&self, cmd: Command) -> Result<crate::client::Rows> {
+    /// Raw command escape hatch: execute a command and return its rows.
+    pub async fn exec(&self, cmd: Command) -> Result<crate::client::Rows> {
         self.conn().exec(cmd).await.map_err(map_proto_err)
     }
 
@@ -250,6 +257,136 @@ impl Ts3Session {
     pub(crate) async fn exec_ok(&self, cmd: Command) -> Result<()> {
         self.exec(cmd).await.map(|_| ())
     }
+
+    fn stop_task(lock: &std::sync::Mutex<Option<VoiceTask>>) {
+        if let Some(task) = lock.lock().unwrap().take() {
+            let _ = task.stop.send(true);
+            task.handle.abort();
+        }
+    }
+}
+
+/// A cancellable spawned voice task.
+struct VoiceTask {
+    stop: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// The send pipeline: pull PCM from the source in 20 ms frames, Opus-encode
+/// and ship as TS3 voice packets (FEATURES.md §6.2).
+async fn run_send_pipeline(
+    conn: Arc<UdpConnection>,
+    mut source: Box<dyn univox_core::audio::AudioSource>,
+    codec: std::sync::Arc<univox_voice::OpusEncoder>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+        univox_voice::FRAME_MS as u64,
+    ));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = stop.changed() => break,
+        }
+        let mut frame = [0.0f32; univox_voice::FRAME_SAMPLES];
+        if source.read(&mut frame).await.unwrap_or(0) == 0 {
+            continue;
+        }
+        match codec.encode(&frame) {
+            Ok(packet) => {
+                // Content = codec byte + opus payload; the actor prepends
+                // the voice sequence id.
+                let mut content = Vec::with_capacity(1 + packet.len());
+                content.push(univox_voice::CODEC_OPUS_VOICE);
+                content.extend_from_slice(&packet);
+                conn.send_voice(content, univox_ts3_proto::PacketType::Voice).await;
+            }
+            Err(e) => tracing::warn!(error = %e, "voice encode failed"),
+        }
+    }
+}
+
+/// The receive pipeline: decode incoming voice packets into per-member
+/// jitter buffers, mix and push PCM to the sink; emits Speaking events
+/// (FEATURES.md §6.4).
+async fn run_recv_pipeline(
+    conn: Arc<UdpConnection>,
+    mut sink: Box<dyn univox_core::audio::AudioSink>,
+    codec: std::sync::Arc<univox_voice::OpusDecoder>,
+    core: Arc<SessionCore>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut voice_rx = conn.voice_sink_handle().subscribe();
+    let mixer = std::sync::Arc::new(std::sync::Mutex::new(univox_voice::Mixer::new(5)));
+    let mixer_decode = mixer.clone();
+
+    // Decode task.
+    let mut stop2 = stop.clone();
+    let decoder = tokio::spawn(async move {
+        loop {
+            let packet = tokio::select! {
+                p = voice_rx.recv() => p,
+                _ = stop2.changed() => break,
+            };
+            let Ok(packet) = packet else { break };
+            // Whispered audio arrives as S2CWhisper but carries the same
+            // shape — mix it like normal voice.
+            let (id, from, c, data) = match packet {
+                univox_ts3_proto::VoiceData::S2C { id, from, codec, data }
+                | univox_ts3_proto::VoiceData::S2CWhisper { id, from, codec, data } => {
+                    (id, from, codec, data)
+                }
+                _ => continue,
+            };
+            if c != univox_voice::CODEC_OPUS_VOICE {
+                continue;
+            }
+            if let Ok(frame) = codec.decode(Some(&data)) {
+                mixer_decode
+                    .lock()
+                    .unwrap()
+                    .push(MemberId::from_u64(u64::from(from)), id, frame);
+            }
+        }
+    });
+
+    // Mixer/pacer task: emits one mixed frame every 20 ms plus speaking
+    // transitions to the event bus.
+    let pacer = tokio::spawn(async move {
+        let mut speaking: Vec<MemberId> = Vec::new();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+            univox_voice::FRAME_MS as u64,
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = stop.changed() => break,
+            }
+            let (mixed, contributors) = mixer.lock().unwrap().mix_frame(univox_voice::FRAME_SAMPLES);
+            for m in &contributors {
+                if !speaking.contains(m) {
+                    core.bus.send(Event::SpeakingStarted { member: m.clone() });
+                }
+            }
+            for m in &speaking {
+                if !contributors.contains(m) {
+                    core.bus.send(Event::SpeakingStopped { member: m.clone() });
+                }
+            }
+            speaking = contributors;
+            if let Err(e) = sink
+                .write(univox_core::audio::AudioPacket { member: None, samples: mixed })
+                .await
+            {
+                tracing::warn!(error = %e, "audio sink failed; stopping receive pipeline");
+                break;
+            }
+        }
+    });
+    let _ = decoder.await;
+    let _ = pacer.await;
 }
 
 /// Pump: client-protocol notifications → book mirror + unified events.
@@ -395,6 +532,41 @@ impl Session for Ts3Session {
         Err(Error::Unsupported(
             "TS3 clients always remain in a channel".into(),
         ))
+    }
+
+    async fn start_sending(&self, source: Box<dyn univox_core::audio::AudioSource>) -> Result<()> {
+        Self::stop_task(&self.sending);
+        let codec = std::sync::Arc::new(univox_voice::OpusEncoder::new()?);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_send_pipeline(
+            self.conn(),
+            source,
+            codec,
+            stop_rx,
+        ));
+        *self.sending.lock().unwrap() = Some(VoiceTask { stop: stop_tx, handle });
+        Ok(())
+    }
+
+    async fn stop_sending(&self) -> Result<()> {
+        Self::stop_task(&self.sending);
+        Ok(())
+    }
+
+    async fn start_receiving(&self, sink: Box<dyn univox_core::audio::AudioSink>) -> Result<()> {
+        Self::stop_task(&self.receiving);
+        let codec = std::sync::Arc::new(univox_voice::OpusDecoder::new()?);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let conn = self.conn();
+        let core = self.core.clone();
+        let handle = tokio::spawn(run_recv_pipeline(conn, sink, codec, core, stop_rx));
+        *self.receiving.lock().unwrap() = Some(VoiceTask { stop: stop_tx, handle });
+        Ok(())
+    }
+
+    async fn stop_receiving(&self) -> Result<()> {
+        Self::stop_task(&self.receiving);
+        Ok(())
     }
 
     async fn create_channel(&self, options: ChannelOptions) -> Result<ChannelId> {

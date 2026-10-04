@@ -710,7 +710,11 @@ impl Actor {
             .param("client_version", &opts.version)
             .param("client_platform", &opts.platform)
             .param("client_key_offset", opts.client_key_offset)
-            .param("client_version_sign", &opts.version_sign);
+            .param("client_version_sign", &opts.version_sign)
+            // Announce audio hardware — the server routes voice only
+            // between clients that declare input/output devices.
+            .param("client_input_hardware", 1)
+            .param("client_output_hardware", 1);
         let mut clientinit = {
             let mut c = clientinit;
             if opts.input_muted {
@@ -1073,6 +1077,7 @@ impl Actor {
     }
 
     fn send_voice(&mut self, content: Vec<u8>, p_type: PacketType) {
+        eprintln!("VOICE SEND type={:?} content_len={}", p_type, content.len());
         let p_id = self.codec.next_out(p_type);
         let mut full = Vec::with_capacity(2 + content.len());
         full.extend_from_slice(&p_id.to_be_bytes());
@@ -1270,6 +1275,7 @@ impl Actor {
             }
             PacketType::Pong => {}
             PacketType::Voice | PacketType::VoiceWhisper => {
+                eprintln!("VOICE DATAGRAM type={:?}", p_type);
                 let unencrypted = header
                     .flags()
                     .map(|f| f.contains(Flags::UNENCRYPTED))
@@ -1280,6 +1286,7 @@ impl Actor {
                     self.decrypt_packet(&data, p_type, p_id)
                 };
                 if let Some(c) = content {
+                    eprintln!("VOICE RECV bytes={} parse={:?}", c.len(), proto::parse_voice(Direction::S2C, Flags::empty(), &c).is_ok());
                     if let Ok(v) = proto::parse_voice(Direction::S2C, Flags::empty(), &c) {
                         let _ = shared.voice_tx.send(v.clone());
                         if let Some(sink) = &self.voice_sink {
