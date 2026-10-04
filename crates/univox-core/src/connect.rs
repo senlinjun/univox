@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::credential::Credential;
-use crate::error::Result;
 use crate::id::ChannelId;
 use crate::ratelimit::RateLimits;
 

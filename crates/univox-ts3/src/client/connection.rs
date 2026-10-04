@@ -65,6 +65,7 @@ impl Default for HandshakeOptions {
 }
 
 /// Connection parameters established by the handshake.
+#[allow(dead_code)]
 pub(crate) struct HandshakeResult {
     pub params: Params,
     /// Our assigned client id (from `initserver aclid`).
@@ -182,7 +183,7 @@ impl UdpConnection {
         let (voice_tx, _) = broadcast::channel(256);
         let (req_tx, req_rx) = mpsc::channel(128);
         let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
-        let (done_tx, mut done_rx): (oneshot::Sender<Result<HandshakeResult>>, _) = oneshot::channel();
+        let (done_tx, done_rx): (oneshot::Sender<Result<HandshakeResult>>, _) = oneshot::channel();
         let replay: std::sync::Arc<std::sync::Mutex<VecDeque<Command>>> = Default::default();
         let stats: std::sync::Arc<std::sync::Mutex<RawStats>> = Default::default();
         let close_reason: CloseReason = Default::default();
@@ -715,7 +716,7 @@ impl Actor {
             // between clients that declare input/output devices.
             .param("client_input_hardware", 1)
             .param("client_output_hardware", 1);
-        let mut clientinit = {
+        let clientinit = {
             let mut c = clientinit;
             if opts.input_muted {
                 c = c.param("client_input_muted", 1);
@@ -940,68 +941,6 @@ impl Actor {
                         self.send_pong(h.packet_id());
                     }
                 }
-            }
-        }
-    }
-
-    /// Wait until the given outgoing packet is acked (an incoming Ack whose
-    /// content equals `p_id` of `p_type`), or an error command arrives.
-    async fn wait_ack_or_error(
-        &mut self,
-        udp_rx: &mut mpsc::Receiver<Vec<u8>>,
-        p_type: PacketType,
-        p_id: u16,
-    ) -> Result<()> {
-        let deadline = Instant::now() + HANDSHAKE_STEP_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Timeout);
-            }
-            let data = match tokio::time::timeout(remaining, udp_rx.recv()).await {
-                Ok(Some(d)) => d,
-                Ok(None) => return Err(Error::Closed),
-                Err(_) => return Err(Error::Timeout),
-            };
-            let Ok(header) = Header::new(Direction::S2C, &data) else {
-                continue;
-            };
-            match header.packet_type() {
-                Ok(PacketType::Ack) | Ok(PacketType::AckLow) => {
-                    // Skip the ignorable server ack (header id 1).
-                    if header.packet_id() == 1 {
-                        continue;
-                    }
-                    let content = self.decrypt_or_fake(&data, header.packet_type().unwrap(), header.packet_id());
-                    if let Some(c) = content {
-                        if c.len() >= 2 {
-                            let acked = u16::from_be_bytes([c[0], c[1]]);
-                            if acked == p_id {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                Ok(PacketType::Command) => {
-                    // Always ack received commands so the server stops
-                    // resending them.
-                    self.queue_ack(PacketType::Command, header.packet_id());
-                    let content = self.decrypt_or_fake(&data, PacketType::Command, header.packet_id());
-                    if let Some(c) = content {
-                        let header_len = Direction::S2C.header_len();
-                        let cmd = Command::parse(&String::from_utf8_lossy(&c[header_len..]))
-                            .map_err(|e| Error::Protocol(format!("bad command: {e}")))?;
-                        if cmd.name == "error" {
-                            let id: i32 = cmd.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
-                            let msg = cmd.get("msg").unwrap_or("").to_string();
-                            return Err(Error::Server { id, msg, extra: Vec::new() });
-                        }
-                    }
-                }
-                Ok(PacketType::Ping) => {
-                    self.send_pong(header.packet_id());
-                }
-                _ => {}
             }
         }
     }

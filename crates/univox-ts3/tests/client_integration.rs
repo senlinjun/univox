@@ -14,7 +14,7 @@ fn init_tracing() {
         .try_init();
 }
 use univox_ts3::client::{self, HandshakeOptions};
-use univox_ts3_proto::{Command, Identity, RowExt};
+use univox_ts3_proto::{Command, Identity};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_connects_runs_commands_and_receives_pushes() {

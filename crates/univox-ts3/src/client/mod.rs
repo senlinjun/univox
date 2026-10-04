@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use univox_ts3_proto as proto;
 use univox_ts3_proto::Identity;
-use univox_ts3_proto::{Command, Error};
+use univox_ts3_proto::Error;
 
 /// One connection attempt: fresh socket, `identity` + matching
 /// `client_key_offset`. Does NOT retry — reconnect supervisors layer their

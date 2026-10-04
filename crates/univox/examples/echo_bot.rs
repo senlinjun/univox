@@ -10,11 +10,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
 use univox_core::event::Event;
 use univox_core::message::MessageContent;
 use univox_core::model::MessageTarget;
-use univox_core::session::{Driver, Session, SessionManager};
+use univox_core::session::SessionManager;
 use univox_core::{ConnectOptions, Credential, SessionRequest};
 use univox_ts3::Ts3Driver;
 

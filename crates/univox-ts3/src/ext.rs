@@ -221,17 +221,14 @@ async fn wait_for_start(
         match tokio::time::timeout(std::time::Duration::from_millis(500), notifications.recv())
             .await
         {
-            Ok(Some(cmd)) => {
-                if names.contains(&cmd.name.as_str()) {
-                    let row = cmd.params.first().cloned().unwrap_or_default();
-                    if row.get("clientftfid").map(|v| v == clientftfid.to_string()) == Some(true) {
-                        return Ok(row);
-                    }
+            Ok(Some(cmd)) if names.contains(&cmd.name.as_str()) => {
+                let row = cmd.params.first().cloned().unwrap_or_default();
+                if row.get("clientftfid").map(|v| v == clientftfid.to_string()) == Some(true) {
+                    return Ok(row);
                 }
             }
             Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => {}
+            Ok(None) | Err(_) => break,
         }
     }
     Err(Error::Timeout)

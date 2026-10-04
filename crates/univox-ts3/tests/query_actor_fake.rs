@@ -6,12 +6,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use univox_ts3::query::{QueryConnection, QueryOptions};
-use univox_ts3_proto::Command;
 
 async fn spawn_fake_server() -> (u16, tokio::sync::mpsc::Sender<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (tx_out, mut rx_out) = tokio::sync::mpsc::channel::<String>(16);
+    let (tx_out, _rx_out) = tokio::sync::mpsc::channel::<String>(16);
     let (tx_in, mut rx_in) = tokio::sync::mpsc::channel::<String>(16);
     tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();

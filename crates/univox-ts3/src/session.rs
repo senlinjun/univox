@@ -5,11 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::broadcast;
-
 use univox_core::connect::{Capabilities, ConnectOptions};
 use univox_core::error::{Error, Result};
-use univox_core::event::{Event, EventBus, EventStream};
+use univox_core::event::{Event, EventStream};
 use univox_core::id::{ChannelId, MemberId, MessageId, SessionId};
 use univox_core::message::MessageContent;
 use univox_core::model::{ChannelOptions, ConnectionStats, DisconnectReason, MessageTarget};
@@ -516,7 +514,8 @@ impl Session for Ts3Session {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.core.set_state(SessionState::Disconnected);
         self.conn()
-            .disconnect(1, message.as_deref().unwrap_or("disconnecting"));
+            .disconnect(1, message.as_deref().unwrap_or("disconnecting"))
+            .await;
         let _ = self.shutdown.send(true);
         Ok(())
     }

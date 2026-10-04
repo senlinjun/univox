@@ -13,7 +13,7 @@ async fn spawn_mock_tsdns(port_answer: &str) -> u16 {
             let Ok((mut sock, _)) = listener.accept().await else { break };
             let answer = answer.clone();
             tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
                 let mut rd = tokio::io::BufReader::new(&mut sock);
                 let mut line = String::new();
                 if rd.read_line(&mut line).await.is_ok() {

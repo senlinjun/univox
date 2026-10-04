@@ -5,6 +5,7 @@
 //! through a global mutex that is held until the server is stopped.
 
 use std::io::Write as _;
+use std::os::unix::io::AsRawFd;
 use std::net::{TcpListener, UdpSocket};
 use std::path::{PathBuf};
 use std::sync::Mutex as StdMutex;
@@ -15,6 +16,35 @@ use tokio::sync::Mutex;
 
 static INSTANCE_LOCK: std::sync::LazyLock<std::sync::Arc<Mutex<()>>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(Mutex::new(())));
+
+/// Cross-process lock: each integration-test file compiles to its own
+/// binary and cargo runs those in parallel — a tokio Mutex only serializes
+/// within one process. The free license admits ONE server per machine, so
+/// booting must also be serialized across processes (flock on a lock file,
+/// released automatically when the process dies).
+struct ProcessLock(std::fs::File);
+
+impl ProcessLock {
+    fn acquire() -> Self {
+        let path = std::env::temp_dir().join("univox-ts3-instance.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .expect("open instance lock file");
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(rc, 0, "flock instance lock");
+        Self(file)
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -61,6 +91,7 @@ pub struct Ts3Server {
     pub apikey: Option<String>,
     _tmpdir: PathBuf,
     _lock: tokio::sync::OwnedMutexGuard<()>,
+    _process_lock: ProcessLock,
     _lines: std::sync::Arc<StdMutex<Vec<String>>>,
 }
 
@@ -85,6 +116,7 @@ impl Ts3Server {
         }
 
         let lock = INSTANCE_LOCK.clone().lock_owned().await;
+        let process_lock = ProcessLock::acquire();
 
         let tmpdir = std::env::temp_dir().join(format!(
             "univox-ts3-test-{}-{}",
@@ -222,6 +254,7 @@ impl Ts3Server {
             apikey,
             _tmpdir: tmpdir,
             _lock: lock,
+            _process_lock: process_lock,
             _lines: lines,
         })
     }

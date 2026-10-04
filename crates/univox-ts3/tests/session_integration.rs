@@ -5,8 +5,8 @@ use std::time::Duration;
 use test_support::Ts3Server;
 use univox_core::event::Event;
 use univox_core::model::{MessageTarget, Permanence};
-use univox_core::session::{Driver, Session, SessionManager};
-use univox_core::{BookConfig, ChannelOptions, ConnectOptions, Credential};
+use univox_core::session::{Session, SessionManager};
+use univox_core::{ChannelOptions, ConnectOptions, Credential};
 use univox_ts3::{Ts3Driver, Ts3Session};
 use univox_ts3_proto::Identity;
 

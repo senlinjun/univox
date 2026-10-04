@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
-use crate::id::{ChannelId, MemberId, RoleId, ServerId};
+use crate::id::{ChannelId, MemberId, RoleId};
 use crate::model::{Channel, Member, MemberState, Role, SelfMember, Server, VoiceState};
 
 /// A single property-level change (G2: attribute-level diffing).

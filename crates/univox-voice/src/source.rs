@@ -1,7 +1,5 @@
 //! Convenience sources for tests and simple bots.
 
-use async_trait::async_trait;
-
 
 use univox_core::error::Result;
 

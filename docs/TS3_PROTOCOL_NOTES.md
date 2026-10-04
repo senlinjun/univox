@@ -1,0 +1,133 @@
+# TS3 协议实现笔记（univox-ts3）
+
+实现过程对照真实 ts3server 3.13.8 验证得出的协议事实与坑位，供后续维护与
+TS6 适配参考。
+
+## 1. 连接层（UDP 9987）
+
+### 1.1 握手（新协议，server ≥ 3.1）
+
+1. **Init1**（C→S，明文）：`MAC=TS3INIT1`，PId 固定 `0x65`，内容
+   `[version(4)][0][timestamp(4)][random0(4)][8 零]`。服务器可能回
+   `Init1`（继续）或 `Init127`（要求重发，需循环重试）。
+2. **Init2/3**：回显 random0，交换 random1。
+3. **initivexpand2**（S→C 命令包，伪造加密）：携带服务器 RSA 证书链、
+   `beta`（54 字节）、`ek`（服务器临时 Curve25519 公钥）。
+   - 证书链验证：根证书固定公钥（ReSpeak tsdeclarations），每级证书的
+     `next_key = pub × clamp(sha512(block[1..]))`，末级为服务器公钥。
+   - `SharedIV = sha512(ECDH(our_ephemeral, ek))[0..32]`，其中
+     `our_ephemeral = client_private_key × ek_random`（注意：客户端的
+     `ek` 素数标量来自身份私钥与随机数推导），再与 alpha（10 字节）/
+     beta（54 字节）异或。
+   - `SharedMac = sha1(SharedIV)[0..8]`。
+4. **clientek**（C→S，Command PId=1，伪造加密）：`ek`（客户端临时公钥）
+   + `proof`（身份私钥对 `ek||beta` 的 ECDSA-P256 签名）。
+5. **clientinit**（Command PId=2）：注意**必须**包含
+   `client_input_hardware=1` 与 `client_output_hardware=1` ——
+   服务器只在这类客户端之间转发语音（未声明的客户端收不到任何语音包，
+   也不会被标记为说话）。
+6. **initserver**（S→C）：`aclid` 为本端 clid；**它会作为对 clientinit
+   的确认**（独立的 Ack id=1 可以忽略）。
+
+### 1.2 包头
+
+- C2S：`MAC(8) | PId(2) | CId(2) | Type(1)`，共 13 字节。
+- S2C：`MAC(8) | PId(2) | Type(1)`，共 11 字节。
+- Type 字节低 4 位为类型（0=Voice 1=VoiceWhisper 2=Command 3=CommandLow
+  4=Ping 5=Pong 6=Ack 7=AckLow 8=Init），高 4 位为 flags
+  （0x10=Fragmented 0x20=NewProtocol 0x40=Compressed 0x80=Unencrypted）。
+- 客户端发出的 Command 恒带 NewProtocol。
+
+### 1.3 加密（EAX，AES-128，8 字节 tag）
+
+- 密钥材料：`sha256(0x31|type|gen(4)|SharedIV)`（有 CId，即 0x31）/
+  `sha256(0x30|…)`（无 CId），key=前 16 字节，nonce=后 16 字节，
+  再 `key[0..2] ^= PId`。每个 (type, gen) 缓存一份。
+- EAX 的 AAD = **包头去 MAC 后的 3~5 字节（PId|CId|Type）**，不含 MAC。
+- 伪造加密（FakeKey `c:\windows\syste` / FakeNonce `m\firewall32.cpl`）：
+  initivexpand2（server pid 0）、clientek（client pid 1）、client 的首个
+  Ack（pid 0）。
+- Ping/Pong 恒不加密，MAC 必须填 `SharedMac` —— 初版漏掉导致服务器
+  静默丢包、30 秒后判死。
+
+### 1.4 命令关联
+
+- 客户端命令追加 `return_code=N`；服务器以 `error id=… return_code=N`
+  包结束该请求。
+- **响应行可能在 error 包之后以通知形式到达**（见 §3）。
+
+## 2. 身份
+
+- P-256，tomcrypt DER（BitString unused-bits 必须为 7，与 OpenSSL 不同）。
+- 官方串格式：`<counter>V<base64(DER)>`，`V` 分隔符可能出现在 base64 内，
+  解析需回退。
+- 安全等级 = `sha1(base64(pubDER)‖counter)` 前导零位数；clientinit 的
+  `client_key_offset` 必须等于生成身份时的 counter，否则 519。
+- 重试连接必须换新身份（521 = clone 检测）。
+
+## 3. 命令响应的“通知化”命名（重要）
+
+客户端协议下，不少命令的**响应行不叫命令名**，而是通知形式
+（对照 tsdeclarations Messages.toml 的 `notify=` 字段）：
+
+| 请求                  | 响应名                    |
+|-----------------------|---------------------------|
+| banlist               | notifybanlist             |
+| clientdblist          | notifyclientdblist        |
+| clientgetuidfromclid  | notifyclientuidfromclid   |
+| clientgetdbidfromuid  | notifyclientdbidfromuid   |
+| clientgetnamefromuid  | notifyclientnamefromuid   |
+| clientgetnamefromdbid | notifyclientnamefromdbid  |
+| messagelist           | notifymessagelist         |
+| messageget            | notifymessage             |
+| complainlist          | notifycomplainlist        |
+| ftgetfilelist         | notifyfilelist(+finished) |
+| ftinitupload          | notifystartupload         |
+| ftinitdownload        | notifystartdownload / notifystatusfiletransfer（失败） |
+| whoami 等             | 无名（首字段即数据）      |
+| clientdbinfo          | 无名，但首字段 `client_flag_avatar` 为空值裸键，易被当成命令名 |
+
+连接层据此做精确路由：响应行发给等待中的 exec（同时仍广播给簿记泵）。
+
+## 4. 服务器行为怪癖（3.13.8 实测）
+
+- 登录后服务器**不会**主动推 clientlist；channellist 会推（带
+  channellistfinished），guest 无法主动请求（permid 27）。
+- `clientupdate` 不接受 `client_description`（1538）；可接受 away、
+  badges、meta_data、is_channel_commander 等。
+- `plugincmd` 的 targetmode 即官方 PluginTargetMode 枚举值
+  （Single=0, CurrentTab=1, Clients=2, All=3）；本版本 2 需要额外
+  target 参数，4 直接拒绝。响应为 `notifyplugincmd`（含 invokerid）。
+- `complandel` 的参数是 `tcldbid` + `fcldbid`（不是文档写的 banid）。
+- `channelclientlist` 在 3.13.8 不存在（256）。
+- 文件传输（见 §5）：`ftgetfilelist` 要求 `cpw`（可空）必须存在；
+  `ftinitupload/download` 须带 `proto=1`，否则 payload 帧协议不同。
+- `clientgetavatar` 不存在；头像按 `/avatar_<client_base64HashClientUID>`
+  存取，上传时服务器会重命名。
+
+## 5. 文件传输（TCP，独立端口）
+
+1. `ftinitupload`/`ftinitdownload`（带 `proto=1`）→ error 包之后收到
+   `notifystartupload/download`（含 ftkey、port、size）。失败则为
+   `notifystatusfiletransfer`（status=2051 文件不存在 / 2054 路径非法等）。
+2. TCP 连到该端口，发送 ASCII ftkey（无 ack），随后：
+   - 上传：写完全部字节 → shutdown 写端 → 等服务器关闭（落盘完成）；
+   - 下载：读到 EOF（size 只是参考）。
+3. `ftstop serverftfid delete=0` 收尾（无害）。
+4. `ftdeletefile`/`ftrenamefile` 也要带 `cpw`。
+
+## 6. 语音
+
+- C2S：`[inner_id(2)][codec(1)][opus]`，inner_id 与外层包 id 同计数器；
+  codec 4 = OpusVoice，20ms/960 样本 @48kHz。
+- S2C：`[inner_id(2)][from(2)][codec(1)][opus]`；whisper 的 S2C 形状相同。
+- 收发双方都必须在 clientinit 声明过硬件（§1.1 第 5 步）。
+- 语音包同样走 EAX（voice_encryption=true 时），不重传、无确认。
+
+## 7. 稳定性要点
+
+- 出站命令重发：350ms 起、指数退避、12 次放弃；30 秒无入包判定断线。
+- 入站乱序命令包进 receive queue；分片（Fragmented）首包带压缩标记，
+  QuickLZ 解压在重组完成后进行。
+- 新 socket 必须先 `writable().await`（tokio 就绪注册竞态会导致首包
+  静默丢弃 —— 重连握手全部超时的根因）。

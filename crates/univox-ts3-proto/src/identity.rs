@@ -5,7 +5,7 @@
 //! `sha1(base64(pubkey-DER) || counter)`.
 
 use crate::crypto::get_hash_cash_level;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::keys::EccKeyPrivP256;
 
 #[derive(Clone)]

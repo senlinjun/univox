@@ -213,7 +213,7 @@ async fn groups_and_permissions() {
 
     let groups = q.exec(Command::new("servergrouplist")).await.expect("servergrouplist");
     assert!(groups.iter().any(|row| row.has("name", "Guest")));
-    let admin_group: u64 = groups
+    let _admin_group: u64 = groups
         .iter()
         .find(|row| row.has("name", "Server Admin"))
         .and_then(|row| row.get("sgid").and_then(|v| v.parse().ok()))

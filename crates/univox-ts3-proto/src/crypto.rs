@@ -182,7 +182,6 @@ pub fn compute_iv_mac(
     ek_priv: &curve25519_dalek::scalar::Scalar,
     server_ek: &curve25519_dalek::edwards::EdwardsPoint,
 ) -> ([u8; 64], [u8; 8]) {
-    use curve25519_dalek::traits::IsIdentity;
     let shared = (server_ek * ek_priv).compress().to_bytes();
     let mut shared_iv = [0u8; 64];
     shared_iv.copy_from_slice(&Sha512::digest(shared));
