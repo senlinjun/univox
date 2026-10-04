@@ -9,6 +9,7 @@ license.workspace = true
 univox-core.workspace = true
 univox-ts3-proto.workspace = true
 univox-voice.workspace = true
+sha1.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true

@@ -20,6 +20,7 @@ use univox_ts3_proto::{Command, Error as T3Error, Identity, RowExt};
 
 use crate::book::apply_to_book;
 use crate::client::UdpConnection;
+use crate::ext::Ts3Ext;
 
 /// Map a protocol error into the unified error type.
 pub fn map_proto_err(e: T3Error) -> Error {
@@ -80,6 +81,10 @@ pub struct Ts3Session {
     sending: std::sync::Mutex<Option<VoiceTask>>,
     /// Active voice receive tasks (FEATURES.md §6.3).
     receiving: std::sync::Mutex<Option<VoiceTask>>,
+    /// Monotonic file-transfer request id (clientftfid).
+    ftfid: std::sync::atomic::AtomicU32,
+    /// Cached own uid (resolved lazily for avatar management).
+    own_uid: std::sync::Mutex<Option<String>>,
     /// Kept for reconnects.
     connect_options: ConnectOptions,
     identity: Identity,
@@ -121,6 +126,8 @@ impl Ts3Session {
             user_disconnect: std::sync::atomic::AtomicBool::new(false),
             sending: std::sync::Mutex::new(None),
             receiving: std::sync::Mutex::new(None),
+            ftfid: std::sync::atomic::AtomicU32::new(1),
+            own_uid: std::sync::Mutex::new(None),
             connect_options: opts,
             identity,
             shutdown: shutdown_tx,
@@ -143,7 +150,7 @@ impl Ts3Session {
         self.conn.read().unwrap().clone()
     }
 
-    fn clid(&self) -> u16 {
+    pub(crate) fn clid(&self) -> u16 {
         self.clid.load(std::sync::atomic::Ordering::Relaxed) as u16
     }
 
@@ -256,6 +263,23 @@ impl Ts3Session {
     /// Run a command, discarding its response rows.
     pub(crate) async fn exec_ok(&self, cmd: Command) -> Result<()> {
         self.exec(cmd).await.map(|_| ())
+    }
+
+    /// This session's own client unique identifier (cached after connect).
+    pub async fn own_uid(&self) -> Result<String> {
+        if let Some(uid) = self.own_uid.lock().unwrap().clone() {
+            return Ok(uid);
+        }
+        let me = MemberId::from_u64(u64::from(self.clid()));
+        let uid = self.uid_from_clid(&me).await?;
+        *self.own_uid.lock().unwrap() = Some(uid.clone());
+        Ok(uid)
+    }
+
+    /// Next clientftfid for file-transfer negotiations.
+    pub fn next_ftfid(&self) -> u32 {
+        self.ftfid
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn stop_task(lock: &std::sync::Mutex<Option<VoiceTask>>) {

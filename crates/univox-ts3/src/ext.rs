@@ -176,6 +176,65 @@ pub trait Ts3Ext: Session {
 
     async fn server_snapshot(&self) -> Result<String>;
     async fn deploy_server_snapshot(&self, snapshot: &str) -> Result<()>;
+
+    // ---- file transfer (§11) ----
+
+    /// List the files of a channel's root (or `path` subdirectory).
+    async fn list_files(&self, channel: &univox_core::id::ChannelId, path: &str)
+        -> Result<Vec<Row>>;
+    /// Upload `data` as `name` (e.g. `/univox_test.txt`) into `channel`.
+    async fn upload_file(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        data: &[u8],
+        overwrite: bool,
+    ) -> Result<()>;
+    /// Download the file `name` from `channel`.
+    async fn download_file(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+    ) -> Result<Vec<u8>>;
+    async fn delete_file(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+    ) -> Result<()>;
+    /// The client's avatar bytes, if one is set (None = no avatar).
+    async fn download_avatar(&self, db_id: &DbId) -> Result<Option<Vec<u8>>>;
+    /// Set this client's avatar to `data`.
+    async fn upload_avatar(&self, data: &[u8]) -> Result<()>;
+}
+
+/// Wait for a transfer-status notification (`notifystartupload`,
+/// `notifystartdownload` or `notifystatusfiletransfer`) whose clientftfid
+/// matches ours (up to 3 s). The ft negotiation answers AFTER the error
+/// packet via these notifications.
+async fn wait_for_start(
+    notifications: &mut crate::client::NotificationStream,
+    names: &[&str],
+    clientftfid: u32,
+) -> Result<Row> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), notifications.recv())
+            .await
+        {
+            Ok(Some(cmd)) => {
+                if names.contains(&cmd.name.as_str()) {
+                    let row = cmd.params.first().cloned().unwrap_or_default();
+                    if row.get("clientftfid").map(|v| v == clientftfid.to_string()) == Some(true) {
+                        return Ok(row);
+                    }
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    Err(Error::Timeout)
 }
 
 /// `list`-style commands answer 1281 "database empty result set" when
@@ -518,5 +577,207 @@ impl Ts3Ext for Ts3Session {
             }
         }
         self.exec_ok(cmd).await
+    }
+
+    async fn list_files(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        path: &str,
+    ) -> Result<Vec<Row>> {
+        // This server requires `cpw` (empty) along with path, and answers
+        // AFTER the error packet with `notifyfilelist` rows terminated by
+        // `notifyfilelistfinished`.
+        let mut notifications = self.conn().subscribe();
+        if let Err(Error::Platform { code: 1281, .. } | Error::Platform { code: 2054, .. }) = self
+            .exec(
+                Command::new("ftgetfilelist")
+                    .param("cid", channel.as_u64().unwrap_or(0))
+                    .param("cpw", "")
+                    .param("path", path),
+            )
+            .await
+        {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                notifications.recv(),
+            )
+            .await
+            {
+                Ok(Some(cmd)) if cmd.name == "notifyfilelist" => out.extend(cmd.params),
+                Ok(Some(cmd)) if cmd.name == "notifyfilelistfinished" => break,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn upload_file(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        data: &[u8],
+        overwrite: bool,
+    ) -> Result<()> {
+        let clientftfid = self.next_ftfid();
+        // The transfer parameters arrive as `notifystartupload` AFTER the
+        // command's error packet — subscribe first so nothing is missed.
+        let mut notifications = self.conn().subscribe();
+        self.exec(
+            Command::new("ftinitupload")
+                .param("clientftfid", clientftfid)
+                .param("serverftfid", 0)
+                .param("cid", channel.as_u64().unwrap_or(0))
+                .param("name", name)
+                .param("cpw", "")
+                .param("size", data.len())
+                .param("overwrite", u8::from(overwrite))
+                .param("resume", 0)
+                .param("proto", 1),
+        )
+        .await?;
+        let row = wait_for_start(
+            &mut notifications,
+            &["notifystartupload", "notifystatusfiletransfer"],
+            clientftfid,
+        )
+        .await?;
+        if let Some(status) = row.get("status").and_then(|v| v.parse::<i64>().ok()) {
+            if status != 0 {
+                return Err(Error::Platform {
+                    platform: univox_core::platform::Platform::Ts3,
+                    code: status as i32,
+                    message: row.get("msg").unwrap_or("upload failed").to_string(),
+                });
+            }
+        }
+        let port: u16 = row.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let ip = row.get("ip").unwrap_or("127.0.0.1");
+        let ft =
+            crate::filetransfer::TransferChannel::connect(ip, port, row.get("ftkey").unwrap_or(""))
+                .await?;
+        ft.upload(data).await?;
+        self.exec_ok(
+            Command::new("ftstop")
+                .param("serverftfid", row.get("serverftfid").unwrap_or("0"))
+                .param("delete", 0),
+        )
+        .await
+    }
+
+    async fn download_file(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+    ) -> Result<Vec<u8>> {
+        let clientftfid = self.next_ftfid();
+        let mut notifications = self.conn().subscribe();
+        self.exec(
+            Command::new("ftinitdownload")
+                .param("clientftfid", clientftfid)
+                .param("name", name)
+                .param("cid", channel.as_u64().unwrap_or(0))
+                .param("cpw", "")
+                .param("seekpos", 0)
+                .param("proto", 1),
+        )
+        .await?;
+        let row = wait_for_start(
+            &mut notifications,
+            &["notifystartdownload", "notifystatusfiletransfer"],
+            clientftfid,
+        )
+        .await?;
+        if let Some(status) = row.get("status").and_then(|v| v.parse::<i64>().ok()) {
+            if status != 0 {
+                return Err(Error::Platform {
+                    platform: univox_core::platform::Platform::Ts3,
+                    code: status as i32,
+                    message: row.get("msg").unwrap_or("download failed").to_string(),
+                });
+            }
+        }
+        let port: u16 = row.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let size: usize = row.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let ip = row.get("ip").unwrap_or("127.0.0.1");
+        let ft =
+            crate::filetransfer::TransferChannel::connect(ip, port, row.get("ftkey").unwrap_or(""))
+                .await?;
+        let data = ft.download(size).await?;
+        self.exec_ok(
+            Command::new("ftstop")
+                .param("serverftfid", row.get("serverftfid").unwrap_or("0"))
+                .param("delete", 0),
+        )
+        .await?;
+        Ok(data)
+    }
+
+    async fn delete_file(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+    ) -> Result<()> {
+        self.exec_ok(
+            Command::new("ftdeletefile")
+                .param("cid", channel.as_u64().unwrap_or(0))
+                .param("cpw", "")
+                .param("name", name),
+        )
+        .await
+    }
+
+    async fn download_avatar(&self, db_id: &DbId) -> Result<Option<Vec<u8>>> {
+        // Avatars live on the server root under /avatar_<hash>, where hash
+        // is the server-computed `client_base64HashClientUID`.
+        let info = self.client_db_info(db_id).await?;
+        let Some(hash) = info
+            .get("client_base64HashClientUID")
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+        else {
+            return Ok(None);
+        };
+        let path = format!("/avatar_{hash}");
+        match self
+            .download_file(&univox_core::id::ChannelId::from_u64(0), &path)
+            .await
+        {
+            Ok(data) => Ok(Some(data)),
+            // 2054 = invalid file path: no avatar stored for this client.
+            Err(Error::Platform { code, .. }) if matches!(code, 1281 | 2054) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn upload_avatar(&self, data: &[u8]) -> Result<()> {
+        // The server stores the upload under /avatar_<our hash>; the name
+        // we upload under is irrelevant.
+        let hash = self
+            .client_db_info(&self.own_dbid().await?)
+            .await?
+            .get("client_base64HashClientUID")
+            .map(String::from)
+            .unwrap_or_default();
+        let path = format!("/avatar_{hash}");
+        self.upload_file(&univox_core::id::ChannelId::from_u64(0), &path, data, true)
+            .await
+    }
+
+}
+
+
+impl Ts3Session {
+    /// This session's own client database id.
+    pub(crate) async fn own_dbid(&self) -> Result<DbId> {
+        let uid = self.own_uid().await?;
+        self.dbid_from_uid(&uid)
+            .await?
+            .ok_or_else(|| Error::Other("own dbid unknown".into()))
     }
 }

@@ -7,6 +7,7 @@
 pub mod book;
 pub mod client;
 pub mod ext;
+pub mod filetransfer;
 pub mod query;
 pub mod session;
 

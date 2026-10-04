@@ -2,7 +2,7 @@
 
 pub mod connection;
 
-pub use connection::{HandshakeOptions, Rows, UdpConnection};
+pub use connection::{HandshakeOptions, NotificationStream, Rows, UdpConnection};
 
 use std::sync::Arc;
 use std::time::Duration;
