@@ -4,6 +4,7 @@
 //! - [`query`]: ServerQuery management driver (telnet-style TCP).
 //! - client protocol (UDP voice + control) — under construction.
 
+pub mod address;
 pub mod book;
 pub mod client;
 pub mod ext;

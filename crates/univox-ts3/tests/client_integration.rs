@@ -70,21 +70,15 @@ async fn client_connects_runs_commands_and_receives_pushes() {
         }
     }
     // Some server runs skip the pushed channellist; request it explicitly.
+    // Guests cannot read the channel list, so take the admin token first —
+    // the exec result then carries the rows deterministically.
     if !saw_channellist {
         let _ = conn
-            .exec(Command::new("channellist").opt("topic"))
+            .exec(Command::new("privilegekeyuse").param("token", &server.admin_token))
             .await;
-        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline2 && !saw_channellist {
-            match tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await {
-                Ok(Some(cmd)) if cmd.name == "channellist" => saw_channellist = true,
-                Ok(Some(cmd)) => {
-                    if cmd.get("client_nickname") == Some("Univox Test Bot") {
-                        saw_whoami = true;
-                    }
-                }
-                _ => break,
-            }
+        match conn.exec(Command::new("channellist").opt("topic")).await {
+            Ok(rows) if !rows.is_empty() => saw_channellist = true,
+            _ => {}
         }
     }
     assert!(saw_channellist, "no channellist (pushed or requested)");

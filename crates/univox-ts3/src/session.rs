@@ -755,6 +755,26 @@ impl univox_core::session::Driver for Ts3Driver {
             }
             _ => Identity::create(),
         };
+        // Parse invite links and resolve ports (SRV/TSDNS) for bare hosts.
+        let mut opts = opts;
+        if let Ok(addr) = crate::address::parse(&opts.address) {
+            if !addr.port_explicit {
+                let path = addr.channel.as_deref().unwrap_or("");
+                if let Ok(port) =
+                    crate::address::resolve_port(&addr.host, path, crate::address::DEFAULT_TSDNS_PORT)
+                        .await
+                {
+                    opts.address = format!("{}:{port}", addr.host);
+                }
+            } else {
+                opts.address = format!("{}:{}", addr.host, addr.port);
+            }
+            if opts.nickname.is_none() {
+                if let Some(nick) = &addr.nickname {
+                    opts.nickname = Some(nick.clone());
+                }
+            }
+        }
         Ts3Session::connect(opts, identity).await.map(|s| s as Arc<dyn Session>)
     }
 }
