@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["voice"]
+voice = ["univox-ts3/voice"]
+
 [dependencies]
 univox-core.workspace = true
 univox-ts3.workspace = true

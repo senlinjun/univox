@@ -9,10 +9,10 @@ use async_trait::async_trait;
 
 use univox_core::error::{Error, Result};
 use univox_core::event::PluginCommandTarget;
-use univox_core::id::{DbId, MemberId, MessageId};
+use univox_core::id::{DbId, MemberId, MessageId, RoleId};
 use univox_core::model::Message;
 use univox_core::session::Session;
-use univox_ts3_proto::{Command, Row, RowExt};
+use univox_ts3_proto::{Command, Row, RowExt, hash_password};
 
 use crate::session::Ts3Session;
 
@@ -33,6 +33,24 @@ pub struct ClientDbEntry {
     pub description: String,
     pub last_connected: Option<u64>,
     pub total_connections: u64,
+}
+
+/// A server group (`servergrouplist`). Server groups are univox roles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerGroup {
+    pub id: RoleId,
+    pub name: String,
+    /// `sgtype`: 1 = template, 2 = regular, 3 = ServerQuery.
+    pub kind: u8,
+}
+
+/// A channel group (`channelgrouplist`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelGroup {
+    pub id: u64,
+    pub name: String,
+    /// `cgtype`: 1 = template, 2 = regular, 3 = ServerQuery.
+    pub kind: u8,
 }
 
 /// Runtime self-state fields for `clientupdate` (FEATURES.md §11).
@@ -196,6 +214,28 @@ pub trait Ts3Ext: Session {
         channel: &univox_core::id::ChannelId,
         name: &str,
     ) -> Result<Vec<u8>>;
+    /// Stream-download `name` from `channel` in chunks (up to 16 KiB);
+    /// see [`FileDownload`](crate::filetransfer::FileDownload) for
+    /// progress (`size`/`received`) and cancellation (drop = finalize).
+    /// `password` is the channel password, plaintext — hashed internally.
+    async fn download_file_stream(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        password: Option<&str>,
+    ) -> Result<crate::filetransfer::FileDownload>;
+    /// Stream-upload exactly `size` bytes as `name` into `channel`
+    /// (overwrites an existing file); see
+    /// [`FileUpload`](crate::filetransfer::FileUpload). Dropping the
+    /// handle before `finish` aborts and deletes the partial file.
+    /// `password` is the channel password, plaintext — hashed internally.
+    async fn upload_file_stream(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        size: u64,
+        password: Option<&str>,
+    ) -> Result<crate::filetransfer::FileUpload>;
     async fn delete_file(
         &self,
         channel: &univox_core::id::ChannelId,
@@ -203,8 +243,45 @@ pub trait Ts3Ext: Session {
     ) -> Result<()>;
     /// The client's avatar bytes, if one is set (None = no avatar).
     async fn download_avatar(&self, db_id: &DbId) -> Result<Option<Vec<u8>>>;
+    /// The avatar of the client with unique id `uid` (resolves the
+    /// database id internally), if one is set.
+    async fn download_avatar_by_uid(&self, uid: &str) -> Result<Option<Vec<u8>>>;
     /// Set this client's avatar to `data`.
     async fn upload_avatar(&self, data: &[u8]) -> Result<()>;
+
+    // ---- channel administration (§8.4) ----
+
+    /// Re-parent a channel and place it among the new parent's children
+    /// (`channelmove`). `order` is the sibling id to sort the channel
+    /// after (0 = first). `password` is the moved channel's own password,
+    /// plaintext — hashed internally like every channel password.
+    async fn move_channel(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        parent: &univox_core::id::ChannelId,
+        order: u64,
+        password: Option<&str>,
+    ) -> Result<()>;
+
+    // ---- typed queries (§8.3/§9.6) ----
+
+    /// `servergrouplist`. Server groups are univox roles.
+    async fn server_groups(&self) -> Result<Vec<ServerGroup>>;
+    /// `channelgrouplist`.
+    async fn channel_groups(&self) -> Result<Vec<ChannelGroup>>;
+    /// `clientpermlist` for this client's own database id, as
+    /// `(permission name or numeric id, value)` pairs.
+    async fn own_permissions(&self) -> Result<Vec<(String, i64)>>;
+    /// `channelsubscribeall` — subscribe to every channel on the server.
+    async fn subscribe_all(&self) -> Result<()>;
+}
+
+/// The file-transfer path of a client's avatar: `/avatar_<hash>`, where
+/// `hash` is the server's `client_base64HashClientUID` (see
+/// `client_db_info`). Useful when transferring avatars by hand via
+/// [`Ts3Ext::download_file_stream`].
+pub fn avatar_path(hash: &str) -> String {
+    format!("/avatar_{hash}")
 }
 
 /// Wait for a transfer-status notification (`notifystartupload`,
@@ -506,7 +583,7 @@ impl Ts3Ext for Ts3Session {
         // [opus data]; whisper_type 1 targets a channel. The connection
         // prepends the voice sequence id.
         let mut content = Vec::with_capacity(11 + frame.len());
-        content.push(univox_voice::CODEC_OPUS_VOICE);
+        content.push(univox_ts3_proto::CODEC_OPUS_VOICE);
         content.push(1); // whisper_type: channel
         content.push(0); // target
         content.extend_from_slice(&channel.as_u64().unwrap_or(0).to_be_bytes());
@@ -621,50 +698,11 @@ impl Ts3Ext for Ts3Session {
         data: &[u8],
         overwrite: bool,
     ) -> Result<()> {
-        let clientftfid = self.next_ftfid();
-        // The transfer parameters arrive as `notifystartupload` AFTER the
-        // command's error packet — subscribe first so nothing is missed.
-        let mut notifications = self.conn().subscribe();
-        self.exec(
-            Command::new("ftinitupload")
-                .param("clientftfid", clientftfid)
-                .param("serverftfid", 0)
-                .param("cid", channel.as_u64().unwrap_or(0))
-                .param("name", name)
-                .param("cpw", "")
-                .param("size", data.len())
-                .param("overwrite", u8::from(overwrite))
-                .param("resume", 0)
-                .param("proto", 1),
-        )
-        .await?;
-        let row = wait_for_start(
-            &mut notifications,
-            &["notifystartupload", "notifystatusfiletransfer"],
-            clientftfid,
-        )
-        .await?;
-        if let Some(status) = row.get("status").and_then(|v| v.parse::<i64>().ok()) {
-            if status != 0 {
-                return Err(Error::Platform {
-                    platform: univox_core::platform::Platform::Ts3,
-                    code: status as i32,
-                    message: row.get("msg").unwrap_or("upload failed").to_string(),
-                });
-            }
-        }
-        let port: u16 = row.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let ip = row.get("ip").unwrap_or("127.0.0.1");
-        let ft =
-            crate::filetransfer::TransferChannel::connect(ip, port, row.get("ftkey").unwrap_or(""))
-                .await?;
-        ft.upload(data).await?;
-        self.exec_ok(
-            Command::new("ftstop")
-                .param("serverftfid", row.get("serverftfid").unwrap_or("0"))
-                .param("delete", 0),
-        )
-        .await
+        let mut up = self
+            .start_upload(channel, name, data.len() as u64, overwrite, None)
+            .await?;
+        up.write_chunk(data).await?;
+        up.finish().await
     }
 
     async fn download_file(
@@ -672,47 +710,42 @@ impl Ts3Ext for Ts3Session {
         channel: &univox_core::id::ChannelId,
         name: &str,
     ) -> Result<Vec<u8>> {
-        let clientftfid = self.next_ftfid();
-        let mut notifications = self.conn().subscribe();
-        self.exec(
-            Command::new("ftinitdownload")
-                .param("clientftfid", clientftfid)
-                .param("name", name)
-                .param("cid", channel.as_u64().unwrap_or(0))
-                .param("cpw", "")
-                .param("seekpos", 0)
-                .param("proto", 1),
-        )
-        .await?;
-        let row = wait_for_start(
-            &mut notifications,
-            &["notifystartdownload", "notifystatusfiletransfer"],
-            clientftfid,
-        )
-        .await?;
-        if let Some(status) = row.get("status").and_then(|v| v.parse::<i64>().ok()) {
-            if status != 0 {
-                return Err(Error::Platform {
-                    platform: univox_core::platform::Platform::Ts3,
-                    code: status as i32,
-                    message: row.get("msg").unwrap_or("download failed").to_string(),
-                });
-            }
+        let mut dl = self.download_file_stream(channel, name, None).await?;
+        let mut out = Vec::with_capacity(dl.size() as usize);
+        while let Some(chunk) = dl.next_chunk().await? {
+            out.extend_from_slice(&chunk);
         }
-        let port: u16 = row.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let size: usize = row.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let ip = row.get("ip").unwrap_or("127.0.0.1");
-        let ft =
-            crate::filetransfer::TransferChannel::connect(ip, port, row.get("ftkey").unwrap_or(""))
-                .await?;
-        let data = ft.download(size).await?;
-        self.exec_ok(
-            Command::new("ftstop")
-                .param("serverftfid", row.get("serverftfid").unwrap_or("0"))
-                .param("delete", 0),
-        )
-        .await?;
-        Ok(data)
+        Ok(out)
+    }
+
+    async fn download_file_stream(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        password: Option<&str>,
+    ) -> Result<crate::filetransfer::FileDownload> {
+        let cpw = password.map(hash_password).unwrap_or_default();
+        let row = self.ft_init_download(channel, name, 0, &cpw).await?;
+        let serverftfid: u32 =
+            row.get("serverftfid").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let size: u64 = row.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let ft = transfer_channel_from(&row).await?;
+        Ok(crate::filetransfer::FileDownload::new(
+            ft,
+            std::sync::Arc::downgrade(&self.conn()),
+            serverftfid,
+            size,
+        ))
+    }
+
+    async fn upload_file_stream(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        size: u64,
+        password: Option<&str>,
+    ) -> Result<crate::filetransfer::FileUpload> {
+        self.start_upload(channel, name, size, true, password).await
     }
 
     async fn delete_file(
@@ -740,7 +773,7 @@ impl Ts3Ext for Ts3Session {
         else {
             return Ok(None);
         };
-        let path = format!("/avatar_{hash}");
+        let path = avatar_path(&hash);
         match self
             .download_file(&univox_core::id::ChannelId::from_u64(0), &path)
             .await
@@ -749,6 +782,13 @@ impl Ts3Ext for Ts3Session {
             // 2054 = invalid file path: no avatar stored for this client.
             Err(Error::Platform { code, .. }) if matches!(code, 1281 | 2054) => Ok(None),
             Err(e) => Err(e),
+        }
+    }
+
+    async fn download_avatar_by_uid(&self, uid: &str) -> Result<Option<Vec<u8>>> {
+        match self.dbid_from_uid(uid).await? {
+            Some(db) => self.download_avatar(&db).await,
+            None => Ok(None),
         }
     }
 
@@ -761,13 +801,126 @@ impl Ts3Ext for Ts3Session {
             .get("client_base64HashClientUID")
             .map(String::from)
             .unwrap_or_default();
-        let path = format!("/avatar_{hash}");
+        let path = avatar_path(&hash);
         self.upload_file(&univox_core::id::ChannelId::from_u64(0), &path, data, true)
-            .await
+            .await?;
+        // Mark the member row so everyone sees the new avatar.
+        self.exec_ok(
+            Command::new("clientupdate").param("client_flag_avatar", md5_hex(data)),
+        )
+        .await
     }
 
-}
+    async fn move_channel(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        parent: &univox_core::id::ChannelId,
+        order: u64,
+        password: Option<&str>,
+    ) -> Result<()> {
+        // TS3 quirk (verified on 3.13.8): reordering within the SAME parent
+        // via `channelmove` errors 770 ("already member of channel") — that
+        // goes through `channeledit` + `channel_order` instead. A parent
+        // change uses `channelmove`.
+        let current = self
+            .book()
+            .channel(channel)
+            .and_then(|c| c.parent_id)
+            .and_then(|p| p.as_u64());
+        if current.is_some() && current == parent.as_u64() {
+            return self
+                .exec_ok(
+                    Command::new("channeledit")
+                        .param("cid", channel.as_u64().unwrap_or(0))
+                        .param("channel_order", order),
+                )
+                .await;
+        }
+        let mut cmd = Command::new("channelmove")
+            .param("cid", channel.as_u64().unwrap_or(0))
+            .param("cpid", parent.as_u64().unwrap_or(0))
+            .param("order", order);
+        if let Some(pw) = password {
+            cmd = cmd.param("cpw", hash_password(pw));
+        }
+        self.exec_ok(cmd).await
+    }
 
+    async fn server_groups(&self) -> Result<Vec<ServerGroup>> {
+        let rows = self
+            .exec_list(
+                Command::new("servergrouplist"),
+                "notifyservergrouplist",
+                "notifyservergrouplistfinished",
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ServerGroup {
+                id: RoleId::from_u64(r.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0)),
+                name: r.get("name").unwrap_or_default().to_string(),
+                kind: r.get("sgtype").and_then(|v| v.parse().ok()).unwrap_or(0),
+            })
+            .collect())
+    }
+
+    async fn channel_groups(&self) -> Result<Vec<ChannelGroup>> {
+        let rows = self
+            .exec_list(
+                Command::new("channelgrouplist"),
+                "notifychannelgrouplist",
+                "notifychannelgrouplistfinished",
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ChannelGroup {
+                id: r.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0),
+                name: r.get("name").unwrap_or_default().to_string(),
+                kind: r.get("cgtype").and_then(|v| v.parse().ok()).unwrap_or(0),
+            })
+            .collect())
+    }
+
+    async fn own_permissions(&self) -> Result<Vec<(String, i64)>> {
+        let db = self.own_dbid().await?;
+        let rows = match self
+            .exec_list(
+                Command::new("clientpermlist")
+                    .param("cldbid", db.as_u64().unwrap_or(0))
+                    .opt("permsid"),
+                "notifyclientpermlist",
+                "notifyclientpermlistfinished",
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            // 1281 "database empty result set": the client has no
+            // permissions stored — an empty list, not an error.
+            Err(Error::Platform { code: 1281, .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let name = r
+                    .get("permsid")
+                    .map(String::from)
+                    .or_else(|| r.get("permid").map(String::from))
+                    .unwrap_or_default();
+                let value = r
+                    .get("permvalue")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                (name, value)
+            })
+            .collect())
+    }
+
+    async fn subscribe_all(&self) -> Result<()> {
+        self.exec_ok(Command::new("channelsubscribeall")).await
+    }
+}
 
 impl Ts3Session {
     /// This session's own client database id.
@@ -777,4 +930,158 @@ impl Ts3Session {
             .await?
             .ok_or_else(|| Error::Other("own dbid unknown".into()))
     }
+
+    /// Negotiate an upload (`ftinitupload`) and open the payload channel.
+    async fn start_upload(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        size: u64,
+        overwrite: bool,
+        password: Option<&str>,
+    ) -> Result<crate::filetransfer::FileUpload> {
+        let cpw = password.map(hash_password).unwrap_or_default();
+        let row = self.ft_init_upload(channel, name, size, overwrite, &cpw).await?;
+        let serverftfid: u32 =
+            row.get("serverftfid").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let ft = transfer_channel_from(&row).await?;
+        Ok(crate::filetransfer::FileUpload::new(
+            ft,
+            std::sync::Arc::downgrade(&self.conn()),
+            serverftfid,
+            size,
+        ))
+    }
+
+    /// Send `ftinitupload` and wait for the transfer parameters.
+    async fn ft_init_upload(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        size: u64,
+        overwrite: bool,
+        cpw: &str,
+    ) -> Result<Row> {
+        let clientftfid = self.next_ftfid();
+        // The transfer parameters arrive as `notifystartupload` AFTER the
+        // command's error packet — subscribe first so nothing is missed.
+        let mut notifications = self.conn().subscribe();
+        self.exec(
+            Command::new("ftinitupload")
+                .param("clientftfid", clientftfid)
+                .param("serverftfid", 0)
+                .param("cid", channel.as_u64().unwrap_or(0))
+                .param("name", name)
+                .param("cpw", cpw)
+                .param("size", size)
+                .param("overwrite", u8::from(overwrite))
+                .param("resume", 0)
+                .param("proto", 1),
+        )
+        .await?;
+        let row = wait_for_start(
+            &mut notifications,
+            &["notifystartupload", "notifystatusfiletransfer"],
+            clientftfid,
+        )
+        .await?;
+        check_ft_status(&row, "upload failed")?;
+        Ok(row)
+    }
+
+    /// Send `ftinitdownload` and wait for the transfer parameters.
+    async fn ft_init_download(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        name: &str,
+        seekpos: u64,
+        cpw: &str,
+    ) -> Result<Row> {
+        let clientftfid = self.next_ftfid();
+        let mut notifications = self.conn().subscribe();
+        self.exec(
+            Command::new("ftinitdownload")
+                .param("clientftfid", clientftfid)
+                .param("name", name)
+                .param("cid", channel.as_u64().unwrap_or(0))
+                .param("cpw", cpw)
+                .param("seekpos", seekpos)
+                .param("proto", 1),
+        )
+        .await?;
+        let row = wait_for_start(
+            &mut notifications,
+            &["notifystartdownload", "notifystatusfiletransfer"],
+            clientftfid,
+        )
+        .await?;
+        check_ft_status(&row, "download failed")?;
+        Ok(row)
+    }
+
+    /// Run a list command whose rows stream in as notifications after the
+    /// error packet (`servergrouplist`, `clientpermlist`, ...). Rows
+    /// returned inline with the command are used directly; notification
+    /// rows are appended until the `finished` marker or a quiet gap.
+    pub(crate) async fn exec_list(
+        &self,
+        cmd: Command,
+        notify_name: &str,
+        finished: &str,
+    ) -> Result<Vec<Row>> {
+        let mut notifications = self.conn().subscribe();
+        let mut rows = self.exec(cmd).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                notifications.recv(),
+            )
+            .await
+            {
+                Ok(Some(c)) if c.name == notify_name => rows.extend(c.params),
+                Ok(Some(c)) if c.name == finished => break,
+                Ok(Some(_)) => {}
+                // 300 ms without a follow-up: the list is complete.
+                Ok(None) | Err(_) => break,
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// Surface a nonzero transfer `status` as a platform error.
+fn check_ft_status(row: &Row, what: &str) -> Result<()> {
+    if let Some(status) = row.get("status").and_then(|v| v.parse::<i64>().ok()) {
+        if status != 0 {
+            return Err(Error::Platform {
+                platform: univox_core::platform::Platform::Ts3,
+                code: status as i32,
+                message: row.get("msg").unwrap_or(what).to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Open the payload TCP channel from a transfer-start row.
+async fn transfer_channel_from(row: &Row) -> Result<crate::filetransfer::TransferChannel> {
+    let port: u16 = row.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ip = row.get("ip").unwrap_or("127.0.0.1");
+    crate::filetransfer::TransferChannel::connect(ip, port, row.get("ftkey").unwrap_or("")).await
+}
+
+/// Lowercase hex MD5 — the `client_flag_avatar` value the server expects
+/// after an avatar upload.
+fn md5_hex(data: &[u8]) -> String {
+    use md5::Digest;
+    let digest = md5::Md5::digest(data);
+    let mut out = String::with_capacity(32);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }

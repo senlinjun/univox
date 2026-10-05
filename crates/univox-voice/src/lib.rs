@@ -15,5 +15,6 @@ pub use source::SineSource;
 /// Canonical voice frame: 20 ms of 48 kHz mono PCM.
 pub const FRAME_MS: u32 = 20;
 pub const FRAME_SAMPLES: usize = 960;
-/// TS3 codec byte for Opus voice (proto CodecType::OpusVoice).
-pub const CODEC_OPUS_VOICE: u8 = 4;
+/// TS3 codec byte for Opus voice — canonical definition lives in
+/// `univox_ts3_proto` (usable without libopus); re-exported for compat.
+pub use univox_ts3_proto::CODEC_OPUS_VOICE;

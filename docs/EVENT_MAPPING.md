@@ -21,12 +21,13 @@
 | TS3 线上命令 | 统一事件 | 说明 |
 |---|---|---|
 | notifycliententerview | MemberJoined / MemberUpdated | `ctid` 为目标频道 |
-| notifyclientleftview / notifyclientdisconnect | MemberLeft（reasonid 拼入 reason） | 移除 member/state |
+| notifyclientleftview / notifyclientdisconnect | MemberLeft（结构化 MemberLeftReason） | 移除 member/state；reasonid 1/4/5/6/8/… 映射见 model.rs，未识别的保留 `Other("reasonid=N")` |
 | notifyclientmoved | ClientMoved | `ctid` 新频道 |
-| notifyclientupdated | MemberUpdated | **增量行**：空 nickname 不覆盖已有值 |
+| notifyclientupdated | MemberUpdated | **增量行**：空 nickname 不覆盖已有值，extra 合并 |
 | notifytextmessage | MessageCreated | targetmode 1/2/3 → Direct/Channel/Server |
+| notifyclientpoke | MessageCreated | target=Poke(invoker)、author=invoker，便于原样回戳 |
 | notifychannelcreated | ChannelCreated | 更新镜像 |
-| notifychanneledited | ChannelUpdated | 更新镜像 |
+| notifychanneledited | ChannelUpdated | **增量行**：extra 合并、空 name 不覆盖（行里只带改动字段，父字段为 `cpid`） |
 | notifychanneldeleted | ChannelDeleted | 删除镜像 |
 | notifychannelmoved | ChannelMoved | cpid/order |
 | notifyplugincmd | PluginCommandReceived | invokerid→member，data→payload |

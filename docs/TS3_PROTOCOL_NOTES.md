@@ -131,3 +131,33 @@ TS6 适配参考。
   QuickLZ 解压在重组完成后进行。
 - 新 socket 必须先 `writable().await`（tokio 就绪注册竞态会导致首包
   静默丢弃 —— 重连握手全部超时的根因）。
+
+## 8. 客户端协议经验补充（2026-10，3.13 实测）
+
+- **clientleftview 的 reasonid** 用 tsdeclarations `Reason` 枚举：
+  0=离开视野（切频道）、1=Moved（有 invoker）、2=订阅、3=超时、
+  4=频道踢、5=服务器踢、6=封禁（带 bantime）、7/11=服务器停止/关闭、
+  8=主动退出。旧资料里"8=踢、10=封禁"是误传。
+- **channelmove 同父频道内重排报 770**（"already member of channel"）；
+  同父内排序要走 `channeledit cid=… channel_order=…`，跨父用 channelmove。
+  另外 `notifychannelcreated/edited` 的父字段是 `cpid`（channellist 是 `pid`）。
+- **文件传输的取消语义**：客户端直接关闭 payload socket 会被服务器当作
+  "传输完成"并提交已写入的部分文件。正确取消顺序是先 `ftstop
+  serverftfid delete=1`（趁 payload 连接还开着），再关 socket。
+  另外 UDP actor 的命令是串行的，并发 exec 会被拒（"concurrent client
+  command"）——收尾型命令要做有界重试。
+- **clientdbinfo 的响应行没有可靠的名字**：行首的空字段会被解析器当成
+  命令名（无头像时是 `client_flag_avatar`；设置头像后变成下一个空字段，
+  如 `client_description`）。识别标准改为"行内含 client_database_id"。
+- **clientupdate client_flag_avatar=<md5hex>**：文件必须已上传，否则
+  报 2051（file not found）；值是头像文件的小写 hex MD5。
+- **serveredit 设置服务器密码**：只发 `virtualserver_password=…` 即可
+  （flag 自动置位）；显式带 `virtualserver_flag_password` 反而报 1538。
+- **clientpermlist** 对没有任何权限记录的客户端返回错误 1281（database
+  empty result set），应按空列表处理。
+- **身份 JSON（tsclientlib/tsproto 0.2）**：`{"key": base64(32 字节裸私钥
+  标量), "counter": u64, "max_counter": u64}`，key 序列化等价于
+  `EccKeyPrivP256::to_short()` 的 base64；读取时 tomcrypt DER 形式同样接受。
+- **clientinit 支持 `client_default_token`**（privilege key，连接时即消费，
+  明文）；`client_server_password` / `client_default_channel_password` 均为
+  `base64(sha1(明文))`。

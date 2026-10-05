@@ -322,6 +322,11 @@ pub enum CodecType {
     OpusMusic = 5,
 }
 
+/// The codec byte prefixed to Opus voice/whisper payloads. Lives here so
+/// drivers without the `voice` feature (no libopus) can still build and
+/// parse voice packets.
+pub const CODEC_OPUS_VOICE: u8 = CodecType::OpusVoice as u8;
+
 /// Parsed voice packet content.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceData {

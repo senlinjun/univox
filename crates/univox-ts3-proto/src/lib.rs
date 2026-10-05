@@ -18,5 +18,5 @@ pub use license::Licenses;
 pub use packet::{
     build_packet, parse_s2c_init, Flags, Header, PacketType, Direction, CodecType, S2CInitData,
     VoiceData, C2S_HEADER_LEN, S2C_HEADER_LEN, MAX_COMMAND_DATA, MAX_FRAGMENTS_LENGTH,
-    MAX_UDP_PACKET_LENGTH, PACKET_TYPE_COUNT, INIT_PACKET_ID, parse_voice,
+    MAX_UDP_PACKET_LENGTH, PACKET_TYPE_COUNT, INIT_PACKET_ID, parse_voice, CODEC_OPUS_VOICE,
 };

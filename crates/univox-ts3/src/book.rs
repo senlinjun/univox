@@ -4,8 +4,8 @@
 use univox_core::event::{Event, RawEvent};
 use univox_core::id::{ChannelId, MemberId, MessageId};
 use univox_core::model::{
-    Channel, ChannelKind, HostMessageMode, Member, MemberState, Message, MessageTarget,
-    OnlineState, Permanence, Server, VoiceState,
+    Channel, ChannelKind, HostMessageMode, Member, MemberLeftReason, MemberState, Message,
+    MessageTarget, OnlineState, Permanence, Server, VoiceState,
 };
 use univox_core::platform::Platform;
 use univox_ts3_proto::{Command, RowExt};
@@ -41,7 +41,12 @@ fn parse_channel(row: &[(String, String)]) -> Channel {
     let get = |k: &str| row.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
     let mut ch = Channel {
         id: channel_id(get("cid").unwrap_or("0")),
-        parent_id: get("pid").and_then(|p| p.parse::<u64>().ok()).map(ChannelId::from_u64),
+        // channellist rows use `pid`; channelcreated/channeledited rows
+        // carry the parent as `cpid`.
+        parent_id: get("pid")
+            .or_else(|| get("cpid"))
+            .and_then(|p| p.parse::<u64>().ok())
+            .map(ChannelId::from_u64),
         name: get("channel_name").unwrap_or("").to_string(),
         topic: get("channel_topic").filter(|s| !s.is_empty()).map(String::from),
         description: get("channel_description").filter(|s| !s.is_empty()).map(String::from),
@@ -111,6 +116,27 @@ fn parse_member(row: &[(String, String)]) -> Member {
             .map(ChannelId::from_u64),
         extra: row.iter().cloned().collect(),
         ..Default::default()
+    }
+}
+
+/// Map the legacy `clientleftview`/`clientmoved` `reasonid` (tsdeclarations
+/// `Reason` enum) into the structured leave reason. Ids without a dedicated
+/// variant keep the raw `reasonid=<n>` encoding.
+fn parse_left_reason(row: &[(String, String)]) -> MemberLeftReason {
+    let get = |k: &str| row.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+    let by = get("invokerid").map(member_id);
+    let message = get("reasonmsg").unwrap_or("").to_string();
+    match get("reasonid").unwrap_or("") {
+        "0" => MemberLeftReason::Left,
+        "1" => MemberLeftReason::Moved { by },
+        "2" => MemberLeftReason::Unsubscribed,
+        "3" => MemberLeftReason::Timeout,
+        "4" => MemberLeftReason::ChannelKicked { by, message },
+        "5" => MemberLeftReason::ServerKicked { by, message },
+        "6" => MemberLeftReason::Banned { by, message },
+        "7" | "11" => MemberLeftReason::ServerStop,
+        "8" => MemberLeftReason::Quit,
+        other => MemberLeftReason::Other(format!("reasonid={other}")),
     }
 }
 
@@ -197,16 +223,13 @@ pub fn apply_to_book(
                 let get = |k: &str| row.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
                 let clid = get("clid").unwrap_or("0");
                 let id = member_id(clid);
-                let reason = get("reasonid").unwrap_or("").to_string();
+                let reason = parse_left_reason(row);
                 book.with_mut(|b| {
                     b.members.remove(&id);
                     b.member_states.remove(&id);
                     b.voice_states.remove(&id);
                 });
-                events.push(Event::MemberLeft {
-                    id,
-                    reason: format!("reasonid={reason}"),
-                });
+                events.push(Event::MemberLeft { id, reason });
             }
             events
         }
@@ -253,6 +276,21 @@ pub fn apply_to_book(
             };
             vec![Event::MessageCreated { message }]
         }
+        "notifyclientpoke" => {
+            let get = |k: &str| cmd.get(k);
+            let invoker_id = member_id(get("invokerid").unwrap_or("0"));
+            let message = Message {
+                id: MessageId::from_string(format!("ts3-{}", chrono_like_id())),
+                // The poke comes from `invoker`; recording them as the
+                // target lets consumers reply in kind (clientpoke clid=...).
+                target: Some(MessageTarget::Poke(invoker_id.clone())),
+                author: Some(invoker_id),
+                author_name: get("invokername").unwrap_or("").to_string(),
+                content: get("msg").unwrap_or("").to_string(),
+                ..Default::default()
+            };
+            vec![Event::MessageCreated { message }]
+        }
         "notifyclientupdated" => {
             let mut events = Vec::new();
             for row in cmd.rows() {
@@ -276,8 +314,22 @@ pub fn apply_to_book(
         "notifychanneledited" | "notifychannelcreated" => {
             let mut events = Vec::new();
             for row in cmd.rows() {
-                let channel = parse_channel(row);
                 let created = cmd.name == "notifychannelcreated";
+                let mut channel = parse_channel(row);
+                if !created {
+                    // Edit rows carry only the changed fields — merge the
+                    // new extra over the stored one and keep the known name
+                    // when the row has none (mirrors the clientupdated
+                    // merge above).
+                    book.with_mut(|b| {
+                        if let Some(old) = b.channels.get_mut(&channel.id) {
+                            if channel.name.is_empty() {
+                                channel.name = old.name.clone();
+                            }
+                            channel.extra.extend(std::mem::take(&mut old.extra));
+                        }
+                    });
+                }
                 book.with_mut(|b| {
                     b.channels.insert(channel.id.clone(), channel.clone());
                 });
@@ -330,13 +382,43 @@ pub fn apply_to_book(
 
 fn apply_initserver(book: &univox_core::Book, self_clid: u64, cmd: &Command) -> Vec<Event> {
     let get = |k: &str| cmd.get(k);
+    // Everything not lifted into a typed field is preserved in `extra`
+    // (privilege key prompt, host message mode, password flag, ...).
+    const PARSED: [&str; 8] = [
+        "virtualserver_id",
+        "virtualserver_name",
+        "virtualserver_welcomemessage",
+        "virtualserver_hostmessage",
+        "virtualserver_hostmessage_mode",
+        "virtualserver_clientsonline",
+        "virtualserver_maxclients",
+        "virtualserver_version",
+    ];
+    let mut extra = std::collections::BTreeMap::new();
+    if let Some(row) = cmd.params.first() {
+        for (k, v) in row {
+            if !PARSED.contains(&k.as_str()) {
+                extra.insert(k.clone(), v.clone());
+            }
+        }
+    }
     let server = Server {
         id: univox_core::id::ServerId::from_u64(
             get("virtualserver_id").map(|v| v.parse::<u64>().ok().unwrap_or(0)).unwrap_or(1),
         ),
         name: get("virtualserver_name").unwrap_or("").to_string(),
-        host_message: get("virtualserver_welcomemessage").filter(|s| !s.is_empty()).map(String::from),
-        host_message_mode: Some(HostMessageMode::Log),
+        host_message: get("virtualserver_hostmessage")
+            .or_else(|| get("virtualserver_welcomemessage"))
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        host_message_mode: get("virtualserver_hostmessage_mode")
+            .and_then(|v| v.parse::<u8>().ok())
+            .map(|m| match m {
+                2 => HostMessageMode::Modal,
+                3 => HostMessageMode::ModalQuit,
+                1 => HostMessageMode::Log,
+                _ => HostMessageMode::None,
+            }),
         member_count: get("virtualserver_clientsonline")
             .map(|v| v.parse::<u64>().ok().unwrap_or(0))
             .unwrap_or(0),
@@ -344,6 +426,7 @@ fn apply_initserver(book: &univox_core::Book, self_clid: u64, cmd: &Command) -> 
             .map(|v| v.parse::<u64>().ok().unwrap_or(0))
             .unwrap_or(0),
         version: get("virtualserver_version").map(String::from),
+        extra,
         ..Default::default()
     };
     let channel_id_of_self = get("client_channel_id")
@@ -445,6 +528,151 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn poke_event() {
+        let b = book();
+        let msg = Command::parse("notifyclientpoke invokerid=3 invokername=Bob msg=hi\\sthere").unwrap();
+        let events = apply_to_book(&b, 1, &msg, StreamOrigin::Client);
+        match &events[0] {
+            Event::MessageCreated { message } => {
+                assert_eq!(message.content, "hi there");
+                assert_eq!(message.author, Some(3u64.into()));
+                assert_eq!(message.author_name, "Bob");
+                assert_eq!(message.target, Some(MessageTarget::Poke(3u64.into())));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leftview_reason_kinds() {
+        let b = book();
+        // Kicked from the channel (reasonid 4) with invoker and message.
+        let cmd = Command::parse("notifyclientleftview cfid=1 ctid=0 clid=5 reasonid=4 reasonmsg=bye invokerid=2 invokername=Admin").unwrap();
+        let events = apply_to_book(&b, 1, &cmd, StreamOrigin::Client);
+        match &events[0] {
+            Event::MemberLeft { id, reason } => {
+                assert_eq!(*id, 5u64.into());
+                match reason {
+                    MemberLeftReason::ChannelKicked { by, message } => {
+                        assert_eq!(*by, Some(2u64.into()));
+                        assert_eq!(message, "bye");
+                    }
+                    other => panic!("unexpected reason: {other:?}"),
+                }
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Voluntary disconnect (8), ban (6), move (1), server stop (11).
+        for (raw, expected) in [
+            ("reasonid=8", "quit"),
+            ("reasonid=6 reasonmsg=2\\sdays bantime=172800 invokerid=2", "ban"),
+            ("reasonid=1 invokerid=2", "moved"),
+            ("reasonid=11", "stop"),
+        ] {
+            let cmd = Command::parse(&format!("notifyclientleftview cfid=1 ctid=0 clid=5 {raw}"))
+                .unwrap();
+            let events = apply_to_book(&b, 1, &cmd, StreamOrigin::Client);
+            let Event::MemberLeft { reason, .. } = &events[0] else {
+                panic!("unexpected: {:?}", events[0]);
+            };
+            let ok = match (expected, reason) {
+                ("quit", MemberLeftReason::Quit) => true,
+                ("ban", MemberLeftReason::Banned { by, message }) => {
+                    *by == Some(2u64.into()) && message == "2 days"
+                }
+                ("moved", MemberLeftReason::Moved { by }) => *by == Some(2u64.into()),
+                ("stop", MemberLeftReason::ServerStop) => true,
+                _ => false,
+            };
+            assert!(ok, "{expected}: got {reason:?}");
+        }
+
+        // Unknown ids are preserved verbatim.
+        let cmd = Command::parse("notifyclientleftview cfid=1 ctid=0 clid=5 reasonid=42").unwrap();
+        let events = apply_to_book(&b, 1, &cmd, StreamOrigin::Client);
+        assert!(matches!(
+            &events[0],
+            Event::MemberLeft { reason: MemberLeftReason::Other(raw), .. } if raw == "reasonid=42"
+        ));
+    }
+
+    #[test]
+    fn member_extra_fields() {
+        let b = book();
+        // Real cliententerview row (field subset the server sends).
+        let cmd = Command::parse("notifycliententerview cfid=0 ctid=3 clid=7 client_nickname=Alice client_unique_identifier=nUqclientId client_database_id=42 client_flag_avatar=avatarHASH client_servergroups=6,7 client_channel_group_id=8 client_type=0 client_is_talker=1").unwrap();
+        apply_to_book(&b, 1, &cmd, StreamOrigin::Client);
+        let m = b.member(&7u64.into()).unwrap();
+        for key in [
+            "client_unique_identifier",
+            "client_database_id",
+            "client_flag_avatar",
+            "client_servergroups",
+            "client_channel_group_id",
+            "client_type",
+            "client_is_talker",
+        ] {
+            assert!(m.extra.contains_key(key), "member extra missing {key}");
+        }
+    }
+
+    #[test]
+    fn channel_extra_fields() {
+        let b = book();
+        // Real channellist row (field subset the server sends).
+        let cmd = Command::parse("cid=1 pid=0 channel_name=Lobby channel_needed_talk_power=10 channel_maxclients=32 channel_maxfamilyclients=-1 channel_delete_delay=0 channel_flag_semi_permanent=0 channel_flag_private=0 channel_icon_id=0").unwrap();
+        apply_to_book(&b, 1, &cmd, StreamOrigin::Client);
+        let c = b.channel(&1u64.into()).unwrap();
+        for key in [
+            "channel_needed_talk_power",
+            "channel_maxclients",
+            "channel_maxfamilyclients",
+            "channel_delete_delay",
+            "channel_flag_semi_permanent",
+            "channel_flag_private",
+            "channel_icon_id",
+        ] {
+            assert!(c.extra.contains_key(key), "channel extra missing {key}");
+        }
+    }
+
+    #[test]
+    fn server_extra_fields() {
+        let b = book();
+        // Real initserver row (field subset the server sends).
+        let cmd = Command::parse("virtualserver_id=1 virtualserver_name=The\\sServer virtualserver_welcomemessage=welcome virtualserver_hostmessage=motd virtualserver_hostmessage_mode=2 virtualserver_clientsonline=2 virtualserver_maxclients=32 virtualserver_version=3.13.7 virtualserver_ask_for_privilegekey=0 virtualserver_flag_password=0 virtualserver_platform=Linux virtualserver_created=1234567890").unwrap();
+        let events = apply_to_book(&b, 1, &cmd, StreamOrigin::Client);
+        assert!(events.is_empty());
+        let s = b.server().unwrap();
+        for key in [
+            "virtualserver_ask_for_privilegekey",
+            "virtualserver_flag_password",
+            "virtualserver_platform",
+            "virtualserver_created",
+        ] {
+            assert!(s.extra.contains_key(key), "server extra missing {key}");
+        }
+        assert_eq!(s.host_message.as_deref(), Some("motd"));
+        assert_eq!(s.host_message_mode, Some(HostMessageMode::Modal));
+    }
+
+    #[test]
+    fn channeledited_merges_extra() {
+        let b = book();
+        let full = Command::parse("cid=2 pid=0 channel_name=Games channel_icon_id=99").unwrap();
+        apply_to_book(&b, 1, &full, StreamOrigin::Client);
+        // A partial edit row: extra keys from the earlier row survive.
+        let edit = Command::parse("notifychanneledited cid=2 channel_topic=fun").unwrap();
+        let events = apply_to_book(&b, 1, &edit, StreamOrigin::Client);
+        assert!(matches!(&events[0], Event::ChannelUpdated { .. }));
+        let c = b.channel(&2u64.into()).unwrap();
+        assert_eq!(c.extra.get("channel_icon_id").map(String::as_str), Some("99"));
+        assert_eq!(c.extra.get("channel_topic").map(String::as_str), Some("fun"));
+        assert_eq!(c.name, "Games", "name survives a partial edit row");
     }
 
     #[test]

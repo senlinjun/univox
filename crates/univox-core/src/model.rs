@@ -241,6 +241,35 @@ impl DisconnectReason {
     }
 }
 
+/// Why a member left the view (FEATURES.md §4). Structured so consumers can
+/// map quit/move/kick/ban kinds directly; platform reason ids that don't map
+/// cleanly are preserved verbatim in [`MemberLeftReason::Other`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberLeftReason {
+    /// Left the visible view normally (e.g. switched to another subscribed
+    /// channel — pair with the following `MemberJoined` for a move).
+    Left,
+    /// Moved out of the view by an invoker (TS3 reasonid 1).
+    Moved { by: Option<MemberId> },
+    /// View lost by unsubscribing (TS3 reasonid 2).
+    Unsubscribed,
+    /// Connection timed out (TS3 reasonid 3).
+    Timeout,
+    /// Kicked from the previous channel (TS3 reasonid 4).
+    ChannelKicked { by: Option<MemberId>, message: String },
+    /// Kicked from the server (TS3 reasonid 5).
+    ServerKicked { by: Option<MemberId>, message: String },
+    /// Banned (TS3 reasonid 6).
+    Banned { by: Option<MemberId>, message: String },
+    /// The server stopped or shut down (TS3 reasonid 7/11).
+    ServerStop,
+    /// Disconnected on their own (TS3 reasonid 8).
+    Quit,
+    /// Anything else — carries the raw platform encoding (e.g.
+    /// `reasonid=9`).
+    Other(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

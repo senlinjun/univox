@@ -1,5 +1,6 @@
 //! Voice pipeline acceptance (FEATURES.md §6): two sessions in the default
 //! channel; A sends a 440 Hz sine, B receives, decodes and mixes it.
+#![cfg(feature = "voice")]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

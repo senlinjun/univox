@@ -618,3 +618,17 @@ async fn keepalive_and_graceful_quit() {
     q.quit().await.ok();
     assert!(q.is_closed());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serveredit_password_sets_flag() {
+    // Empirical: `serveredit virtualserver_password=...` alone is accepted
+    // and implies `virtualserver_flag_password=1`; sending the flag
+    // explicitly errors 1538 (invalid parameter) on 3.13.
+    let server = spawn_server().await;
+    let q = admin_on(server.query_port, &server.serveradmin_password).await;
+    q.exec(Command::new("serveredit").param("virtualserver_password", "s3cret"))
+        .await
+        .expect("serveredit password");
+    let info = q.exec_one(Command::new("serverinfo")).await.unwrap();
+    assert_eq!(info.get("virtualserver_flag_password"), Some("1"));
+}

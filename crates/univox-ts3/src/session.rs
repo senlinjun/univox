@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use univox_core::connect::{Capabilities, ConnectOptions};
+use univox_core::connect::{Capabilities, ConnectOptions, InitialChannel};
 use univox_core::error::{Error, Result};
 use univox_core::event::{Event, EventStream};
 use univox_core::id::{ChannelId, MemberId, MessageId, SessionId};
@@ -14,7 +14,7 @@ use univox_core::model::{ChannelOptions, ConnectionStats, DisconnectReason, Mess
 use univox_core::session::SessionState;
 use univox_core::session::{Session, SessionCore};
 use univox_core::Book;
-use univox_ts3_proto::{Command, Error as T3Error, Identity, RowExt};
+use univox_ts3_proto::{Command, Error as T3Error, Identity, RowExt, hash_password};
 
 use crate::book::apply_to_book;
 use crate::client::UdpConnection;
@@ -62,6 +62,90 @@ pub fn ts3_capabilities() -> Capabilities {
     }
 }
 
+/// TS3-specific connect options, attached via
+/// [`ConnectOptions::with_extension`](univox_core::connect::ConnectOptions::with_extension).
+///
+/// Passwords are taken as plaintext and hashed internally; the identity is
+/// optionally raised to a target hash-cash security level before the
+/// handshake (equivalent to tsclientlib's upgrade-on-connect).
+#[derive(Debug, Clone, Default)]
+pub struct Ts3ConnectOptions {
+    /// Server password (`client_server_password`), plaintext.
+    pub server_password: Option<String>,
+    /// Privilege key, consumed by the first `clientinit`
+    /// (`client_default_token`). Reconnects do not replay it.
+    pub privilege_key: Option<String>,
+    /// Fail the handshake unless the server's license uid matches this
+    /// (anti-DNS-hijack pin).
+    pub server_uid_pin: Option<String>,
+    /// Raise the identity's hash-cash level to at least this before
+    /// connecting (e.g. 24). CPU-bound: runs off the async thread.
+    pub upgrade_identity_to: Option<u8>,
+}
+
+impl Ts3ConnectOptions {
+    /// Look the extension up in unified [`ConnectOptions`].
+    fn from_connect(opts: &ConnectOptions) -> Self {
+        opts.extension::<Self>().cloned().unwrap_or_default()
+    }
+}
+
+/// Build the handshake options from the unified connect options plus the
+/// TS3 extension.
+fn build_handshake_options(
+    opts: &ConnectOptions,
+    ts3: &Ts3ConnectOptions,
+    identity: &Identity,
+) -> crate::client::HandshakeOptions {
+    let mut hs = crate::client::HandshakeOptions {
+        nickname: opts.nickname.clone().unwrap_or_else(|| "UnivoxBot".into()),
+        client_key_offset: identity.counter(),
+        input_muted: opts.initial_state.input_muted,
+        output_muted: opts.initial_state.output_muted,
+        ..Default::default()
+    };
+    match &opts.initial_channel {
+        Some(InitialChannel::Path(p)) => hs.default_channel = p.clone(),
+        Some(InitialChannel::PathWithPassword { path, password }) => {
+            hs.default_channel = path.clone();
+            hs.channel_password = hash_password(password);
+        }
+        // A channel id cannot be carried by clientinit; the session moves
+        // there right after connecting.
+        Some(InitialChannel::Id(_)) | None => {}
+    }
+    if let Some(pw) = &ts3.server_password {
+        hs.server_password = hash_password(pw);
+    }
+    if let Some(token) = &ts3.privilege_key {
+        hs.default_token = token.clone();
+    }
+    if let Some(pin) = &ts3.server_uid_pin {
+        hs.server_uid_pin = Some(pin.clone());
+    }
+    hs
+}
+
+/// Raise the identity to the target hash-cash level if it is below it.
+/// Returns the (possibly upgraded) identity and whether an upgrade
+/// happened. CPU-bound work runs off the async thread.
+async fn maybe_upgrade_identity(
+    identity: Identity,
+    target: Option<u8>,
+) -> Result<(Identity, bool)> {
+    let Some(target) = target else {
+        return Ok((identity, false));
+    };
+    if identity.level() >= target {
+        return Ok((identity, false));
+    }
+    let upgraded =
+        tokio::task::spawn_blocking(move || identity.upgrade_level_blocking(target))
+            .await
+            .map_err(|e| Error::Other(format!("identity upgrade aborted: {e}")))?;
+    Ok((upgraded, true))
+}
+
 /// A connected TeamSpeak 3 session (native client protocol).
 ///
 /// A supervisor task watches the connection and re-establishes it per the
@@ -76,8 +160,10 @@ pub struct Ts3Session {
     /// Set when the USER closed the session — the supervisor then stops.
     user_disconnect: std::sync::atomic::AtomicBool,
     /// Active voice send task (FEATURES.md §6.2).
+    #[cfg(feature = "voice")]
     sending: std::sync::Mutex<Option<VoiceTask>>,
     /// Active voice receive tasks (FEATURES.md §6.3).
+    #[cfg(feature = "voice")]
     receiving: std::sync::Mutex<Option<VoiceTask>>,
     /// Monotonic file-transfer request id (clientftfid).
     ftfid: std::sync::atomic::AtomicU32,
@@ -96,14 +182,14 @@ impl Ts3Session {
             .address
             .parse()
             .map_err(|_| Error::InvalidArgument(format!("bad address {}", opts.address)))?;
-        let nickname = opts.nickname.clone().unwrap_or_else(|| "UnivoxBot".into());
-        let hs_opts = crate::client::HandshakeOptions {
-            nickname,
-            client_key_offset: identity.counter(),
-            input_muted: opts.initial_state.input_muted,
-            output_muted: opts.initial_state.output_muted,
-            ..Default::default()
-        };
+        let ts3_opts = Ts3ConnectOptions::from_connect(&opts);
+
+        // Auto-upgrade the identity's hash-cash level before the handshake
+        // (FEATURES.md §3) — callers don't have to run hash-cash themselves.
+        let (identity, upgraded) =
+            maybe_upgrade_identity(identity, ts3_opts.upgrade_identity_to).await?;
+
+        let hs_opts = build_handshake_options(&opts, &ts3_opts, &identity);
         let (conn, clid) =
             crate::client::connect(addr, &identity, hs_opts.clone()).await.map_err(map_proto_err)?;
 
@@ -122,7 +208,9 @@ impl Ts3Session {
             addr,
             clid: std::sync::atomic::AtomicU32::from(u32::from(clid)),
             user_disconnect: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "voice")]
             sending: std::sync::Mutex::new(None),
+            #[cfg(feature = "voice")]
             receiving: std::sync::Mutex::new(None),
             ftfid: std::sync::atomic::AtomicU32::new(1),
             own_uid: std::sync::Mutex::new(None),
@@ -134,12 +222,34 @@ impl Ts3Session {
         start_pump(&core, &conn, clid, shutdown_rx.clone());
         prime_book(&core, &conn, clid).await;
 
+        // The privilege key was consumed by this connect; reconnects must
+        // not replay it. Passwords stay — the server still wants them.
+        let mut reconnect_hs = hs_opts;
+        reconnect_hs.default_token.clear();
+
         // The supervisor: watch for connection loss and reconnect per the
         // policy, restoring state (FEATURES.md §2.2/§2.4).
         let sup = session.clone();
         tokio::spawn(async move {
-            sup.supervise(hs_opts, shutdown_rx).await;
+            sup.supervise(reconnect_hs, shutdown_rx).await;
         });
+
+        // A channel id cannot ride on clientinit — join it explicitly.
+        if let Some(InitialChannel::Id(cid)) = &session.connect_options.initial_channel {
+            let me = MemberId::from_u64(u64::from(clid));
+            if let Err(e) = session.move_member(&me, cid).await {
+                tracing::warn!(
+                    error = %e,
+                    channel = cid.as_u64().unwrap_or(0),
+                    "initial channel join failed"
+                );
+            }
+        }
+        if upgraded {
+            session.core.bus.send(Event::IdentityLevelIncreased {
+                level: u32::from(session.identity.level()),
+            });
+        }
 
         Ok(session)
     }
@@ -280,6 +390,7 @@ impl Ts3Session {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(feature = "voice")]
     fn stop_task(lock: &std::sync::Mutex<Option<VoiceTask>>) {
         if let Some(task) = lock.lock().unwrap().take() {
             let _ = task.stop.send(true);
@@ -289,6 +400,7 @@ impl Ts3Session {
 }
 
 /// A cancellable spawned voice task.
+#[cfg(feature = "voice")]
 struct VoiceTask {
     stop: tokio::sync::watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
@@ -296,6 +408,7 @@ struct VoiceTask {
 
 /// The send pipeline: pull PCM from the source in 20 ms frames, Opus-encode
 /// and ship as TS3 voice packets (FEATURES.md §6.2).
+#[cfg(feature = "voice")]
 async fn run_send_pipeline(
     conn: Arc<UdpConnection>,
     mut source: Box<dyn univox_core::audio::AudioSource>,
@@ -332,6 +445,7 @@ async fn run_send_pipeline(
 /// The receive pipeline: decode incoming voice packets into per-member
 /// jitter buffers, mix and push PCM to the sink; emits Speaking events
 /// (FEATURES.md §6.4).
+#[cfg(feature = "voice")]
 async fn run_recv_pipeline(
     conn: Arc<UdpConnection>,
     mut sink: Box<dyn univox_core::audio::AudioSink>,
@@ -557,6 +671,7 @@ impl Session for Ts3Session {
         ))
     }
 
+    #[cfg(feature = "voice")]
     async fn start_sending(&self, source: Box<dyn univox_core::audio::AudioSource>) -> Result<()> {
         Self::stop_task(&self.sending);
         let codec = std::sync::Arc::new(univox_voice::OpusEncoder::new()?);
@@ -571,11 +686,28 @@ impl Session for Ts3Session {
         Ok(())
     }
 
+    #[cfg(not(feature = "voice"))]
+    async fn start_sending(
+        &self,
+        _source: Box<dyn univox_core::audio::AudioSource>,
+    ) -> Result<()> {
+        Err(Error::Unsupported(
+            "univox-ts3 built without the `voice` feature".into(),
+        ))
+    }
+
+    #[cfg(feature = "voice")]
     async fn stop_sending(&self) -> Result<()> {
         Self::stop_task(&self.sending);
         Ok(())
     }
 
+    #[cfg(not(feature = "voice"))]
+    async fn stop_sending(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "voice")]
     async fn start_receiving(&self, sink: Box<dyn univox_core::audio::AudioSink>) -> Result<()> {
         Self::stop_task(&self.receiving);
         let codec = std::sync::Arc::new(univox_voice::OpusDecoder::new()?);
@@ -587,8 +719,21 @@ impl Session for Ts3Session {
         Ok(())
     }
 
+    #[cfg(not(feature = "voice"))]
+    async fn start_receiving(&self, _sink: Box<dyn univox_core::audio::AudioSink>) -> Result<()> {
+        Err(Error::Unsupported(
+            "univox-ts3 built without the `voice` feature".into(),
+        ))
+    }
+
+    #[cfg(feature = "voice")]
     async fn stop_receiving(&self) -> Result<()> {
         Self::stop_task(&self.receiving);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "voice"))]
+    async fn stop_receiving(&self) -> Result<()> {
         Ok(())
     }
 
@@ -616,6 +761,12 @@ impl Session for Ts3Session {
         }
         if let Some(pw) = &options.password {
             cmd = cmd.param("channel_password", pw);
+        }
+        // Generic passthrough: `extra` carries raw protocol params the
+        // typed fields don't model (channel_order,
+        // channel_needed_talk_power, channel_icon_id, ...).
+        for (k, v) in &options.extra {
+            cmd = cmd.param(k.as_str(), v.as_str());
         }
         let rows = self.exec(cmd).await?;
         // The server sends no data row for channelcreate; it announces the
@@ -657,6 +808,11 @@ impl Session for Ts3Session {
         }
         if let Some(limit) = options.user_limit {
             cmd = cmd.param("channel_maxclients", limit);
+        }
+        // Generic passthrough (see create_channel): e.g. channel_order and
+        // channel_needed_talk_power for the two edit-only knobs.
+        for (k, v) in &options.extra {
+            cmd = cmd.param(k.as_str(), v.as_str());
         }
         self.exec_ok(cmd).await
     }
@@ -773,6 +929,12 @@ impl univox_core::session::Driver for Ts3Driver {
                     opts.nickname = Some(nick.clone());
                 }
             }
+            // An invite link carrying a channel joins it after connecting.
+            if opts.initial_channel.is_none() {
+                if let Some(channel) = addr.channel.filter(|c| !c.is_empty()) {
+                    opts.initial_channel = Some(InitialChannel::Path(channel));
+                }
+            }
         }
         Ts3Session::connect(opts, identity).await.map(|s| s as Arc<dyn Session>)
     }
@@ -781,4 +943,68 @@ impl univox_core::session::Driver for Ts3Driver {
 /// The client id assigned to this session by the server.
 pub fn self_clid(session: &Ts3Session) -> u64 {
     u64::from(session.clid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connect_opts(ts3: Ts3ConnectOptions) -> ConnectOptions {
+        ConnectOptions::new("127.0.0.1:9987").with_extension(ts3)
+    }
+
+    #[test]
+    fn handshake_options_wiring() {
+        // Plaintext passwords are hashed internally; privilege key and uid
+        // pin pass through; the initial channel feeds the default channel.
+        let opts = connect_opts(Ts3ConnectOptions {
+            server_password: Some("s3cret".into()),
+            privilege_key: Some("token123".into()),
+            server_uid_pin: Some("testuid=".into()),
+            upgrade_identity_to: None,
+        })
+        .nickname("Bot")
+        .initial_channel(InitialChannel::PathWithPassword {
+            path: "/lobby/hall".into(),
+            password: "chpw".into(),
+        });
+        let identity = Identity::create();
+        let ts3 = Ts3ConnectOptions::from_connect(&opts);
+        let hs = build_handshake_options(&opts, &ts3, &identity);
+        assert_eq!(hs.nickname, "Bot");
+        assert_eq!(hs.default_channel, "/lobby/hall");
+        assert_eq!(hs.channel_password, hash_password("chpw"));
+        assert_eq!(hs.server_password, hash_password("s3cret"));
+        assert_eq!(hs.default_token, "token123");
+        assert_eq!(hs.server_uid_pin.as_deref(), Some("testuid="));
+        assert_eq!(hs.client_key_offset, identity.counter());
+    }
+
+    #[test]
+    fn handshake_options_without_extension() {
+        let opts = ConnectOptions::new("127.0.0.1:9987");
+        let hs = build_handshake_options(&opts, &Ts3ConnectOptions::default(), &Identity::create());
+        assert_eq!(hs.default_channel, "");
+        assert_eq!(hs.channel_password, "");
+        assert_eq!(hs.server_password, "");
+        assert_eq!(hs.default_token, "");
+        assert!(hs.server_uid_pin.is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_upgrade_targets_level() {
+        // A fresh counter-0 identity is below level 12 and gets raised.
+        let identity = Identity::new(univox_ts3_proto::EccKeyPrivP256::create(), 0);
+        let (identity, upgraded) =
+            maybe_upgrade_identity(identity, Some(12)).await.unwrap();
+        assert!(upgraded);
+        assert!(identity.level() >= 12);
+
+        // No target / already-sufficient level: unchanged.
+        let (identity, upgraded) = maybe_upgrade_identity(identity, None).await.unwrap();
+        assert!(!upgraded);
+        let (_, upgraded) =
+            maybe_upgrade_identity(identity, Some(1)).await.unwrap();
+        assert!(!upgraded);
+    }
 }

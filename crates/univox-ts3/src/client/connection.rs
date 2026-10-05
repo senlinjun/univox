@@ -38,6 +38,9 @@ pub struct HandshakeOptions {
     /// base64(sha1(password)) or empty.
     pub channel_password: String,
     pub server_password: String,
+    /// Privilege key sent as `client_default_token` (consumed by the
+    /// server on first connect; do not replay on reconnects).
+    pub default_token: String,
     /// Verify the server's identity uid against this (anti-DNS-hijack).
     pub server_uid_pin: Option<String>,
 }
@@ -59,6 +62,7 @@ impl Default for HandshakeOptions {
             default_channel: String::new(),
             channel_password: String::new(),
             server_password: String::new(),
+            default_token: String::new(),
             server_uid_pin: None,
         }
     }
@@ -733,10 +737,10 @@ impl Actor {
             if !opts.server_password.is_empty() {
                 c = c.param("client_server_password", &opts.server_password);
             }
-            c.param("client_nickname_phonetic", "")
-                .param("client_meta_data", "")
-                .param("client_default_token", "")
-                .param("client_hardware_id", "")
+        c.param("client_nickname_phonetic", "")
+            .param("client_meta_data", "")
+            .param("client_default_token", &opts.default_token)
+            .param("client_hardware_id", "")
         };
 
         // Combined state machine: wait for the clientek ack, send
@@ -1424,7 +1428,17 @@ impl Actor {
             && self
                 .pending_cmd
                 .as_deref()
-                .map(|req| is_response_name(&cmd.name, req))
+                .map(|req| {
+                    is_response_name(&cmd.name, req)
+                        // clientdbinfo's response leads with whatever
+                        // fields are empty — with an avatar set, the bare
+                        // name becomes the next empty field (e.g.
+                        // `client_description`). Its rows always carry the
+                        // database id.
+                        || (req == "clientdbinfo"
+                            && !cmd.name.starts_with("notify")
+                            && cmd.get("client_database_id").is_some())
+                })
                 .unwrap_or(false)
         {
             self.pending_rows.extend(cmd.params.clone());

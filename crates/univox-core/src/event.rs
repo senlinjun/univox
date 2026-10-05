@@ -6,7 +6,9 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::id::{ChannelId, MemberId};
-use crate::model::{Channel, DisconnectReason, Member, Message, Server};
+use crate::model::{
+    Channel, DisconnectReason, Member, MemberLeftReason, Message, Server,
+};
 
 /// An unmapped platform event, passed through verbatim (G3: no information
 /// loss).
@@ -47,7 +49,9 @@ pub enum Event {
 
     // Members
     MemberJoined { member: Member },
-    MemberLeft { id: MemberId, reason: String },
+    /// Structured leave reason (kick/ban/move/quit — see
+    /// [`MemberLeftReason`]).
+    MemberLeft { id: MemberId, reason: MemberLeftReason },
     MemberOnline { id: MemberId },
     MemberOffline { id: MemberId },
     MemberUpdated { member: Member },
