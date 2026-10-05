@@ -161,3 +161,10 @@ TS6 适配参考。
 - **clientinit 支持 `client_default_token`**（privilege key，连接时即消费，
   明文）；`client_server_password` / `client_default_channel_password` 均为
   `base64(sha1(明文))`。
+- **`client_key_offset`（hash-cash counter）可跨连接复用**：它只是
+  工作量证明（服务器验证 `sha1(base64(pubkey)||counter)` 前导零位数），
+  不是服务端消耗的一次性值。tsclientlib 0.2 每次连接都直接发送
+  `identity.counter()`，从不递增；连接后发现服务器要求更高等级时
+  就地 `upgrade_level` 后重连。因此身份必须在连接后回写持久化
+  （counter/max_counter），保证升级搜索不回退、等级不退步。
+- **ftcreatedir 的路径参数名是 `dirname`**（不是 `path`）。

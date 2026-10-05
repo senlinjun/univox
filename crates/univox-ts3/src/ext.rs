@@ -236,6 +236,15 @@ pub trait Ts3Ext: Session {
         size: u64,
         password: Option<&str>,
     ) -> Result<crate::filetransfer::FileUpload>;
+    /// `ftcreatedir` — create a directory in `channel`'s file area
+    /// (`path` like `/newdir` or `/parent/newdir`). `password` is the
+    /// channel password, plaintext — hashed internally.
+    async fn create_dir(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        path: &str,
+        password: Option<&str>,
+    ) -> Result<()>;
     async fn delete_file(
         &self,
         channel: &univox_core::id::ChannelId,
@@ -746,6 +755,22 @@ impl Ts3Ext for Ts3Session {
         password: Option<&str>,
     ) -> Result<crate::filetransfer::FileUpload> {
         self.start_upload(channel, name, size, true, password).await
+    }
+
+    async fn create_dir(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        path: &str,
+        password: Option<&str>,
+    ) -> Result<()> {
+        let cpw = password.map(hash_password).unwrap_or_default();
+        self.exec_ok(
+            Command::new("ftcreatedir")
+                .param("cid", channel.as_u64().unwrap_or(0))
+                .param("dirname", path)
+                .param("cpw", cpw),
+        )
+        .await
     }
 
     async fn delete_file(

@@ -368,6 +368,18 @@ impl Ts3Session {
         self.conn().exec(cmd).await.map_err(map_proto_err)
     }
 
+    /// The identity this session authenticated with — after any
+    /// `Ts3ConnectOptions::upgrade_identity_to` work, so `counter()` and
+    /// `max_counter()` reflect what this connection actually used.
+    ///
+    /// Persist them after connecting: the hash-cash search resumes from
+    /// `max_counter`, and a later session that starts from a smaller
+    /// counter wastes work (and may fall below a server that raised its
+    /// required security level).
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     /// Run a command, discarding its response rows.
     pub(crate) async fn exec_ok(&self, cmd: Command) -> Result<()> {
         self.exec(cmd).await.map(|_| ())

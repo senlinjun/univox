@@ -402,3 +402,110 @@ async fn poke_delivers_message_created() {
     b.disconnect(None).await.ok();
 }
 
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_counter_survives_reconnect() {
+    // The hash-cash counter is a proof-of-work stamp, not a consumed
+    // nonce: the same identity/counter connects twice in a row (matches
+    // tsclientlib, which never increments per attempt — lib.rs just sends
+    // identity.counter() as client_key_offset).
+    let server = spawn_server().await;
+    let addr = format!("127.0.0.1:{}", server.voice_port);
+    let identity = Identity::create();
+
+    let s1 = Ts3Session::connect(
+        ConnectOptions::new(addr.clone()).nickname("Reuser").credential(Credential::Anonymous),
+        identity.clone(),
+    )
+    .await
+    .expect("first connect");
+    assert_eq!(
+        s1.identity().counter(),
+        identity.counter(),
+        "connect itself must not move the counter"
+    );
+    s1.disconnect(None).await.ok();
+    // The server releases the old client record asynchronously; a clone
+    // connecting too fast is rejected.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let s2 = Ts3Session::connect(
+        ConnectOptions::new(addr).nickname("Reuser").credential(Credential::Anonymous),
+        identity.clone(),
+    )
+    .await
+    .expect("second connect with the same identity/counter");
+    assert_eq!(s2.identity().counter(), identity.counter());
+    s2.disconnect(None).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raised_security_level_requires_upgrade() {
+    let server = spawn_server().await;
+    let addr = format!("127.0.0.1:{}", server.voice_port);
+    let q = univox_ts3::QuerySession::connect(univox_ts3::QueryOptions {
+        port: server.query_port,
+        username: Some("serveradmin".into()),
+        password: Some(server.serveradmin_password.clone()),
+        server: Some(1),
+        ..Default::default()
+    })
+    .await
+    .expect("admin query");
+    q.exec(Command::new("serveredit").param("virtualserver_needed_identity_security_level", 14))
+        .await
+        .expect("raise required level");
+
+    // With upgrade_identity_to the identity is raised before clientinit
+    // and the session exposes the final state for persistence.
+    let upgraded = Ts3Session::connect(
+        ConnectOptions::new(addr.clone())
+            .nickname("Upgraded")
+            .credential(Credential::Anonymous)
+            .with_extension(Ts3ConnectOptions {
+                upgrade_identity_to: Some(14),
+                ..Default::default()
+            }),
+        Identity::create(),
+    )
+    .await
+    .expect("connect with upgrade_identity_to");
+    assert!(upgraded.identity().level() >= 14, "readback level");
+    upgraded.disconnect(None).await.ok();
+
+    // A default level-8 identity is refused (clientinit error, or dropped
+    // right after). Runs last: a failed attempt may flood-ban the source.
+    let plain = Ts3Session::connect(
+        ConnectOptions::new(addr).nickname("LowLevel").credential(Credential::Anonymous),
+        Identity::create(),
+    )
+    .await;
+    let rejected = match plain {
+        Err(_) => true,
+        Ok(s) => {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            s.state() != univox_core::session::SessionState::Connected
+        }
+    };
+    assert!(rejected, "level-8 identity must not stay on a level-14 server");
+    q.quit().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_dir_shows_in_listing() {
+    let server = spawn_server().await;
+    let session = spawn_admin("DirMaker", &server).await;
+    let channel = ChannelId::from_u64(1);
+
+    session.create_dir(&channel, "/univox_dir", None).await.expect("ftcreatedir");
+    let listing = session.list_files(&channel, "/").await.expect("list");
+    let entry = listing
+        .iter()
+        .find(|r| r.get("name").map(|n| n.trim_start_matches('/')) == Some("univox_dir"))
+        .expect("directory missing from listing");
+    assert_eq!(entry.get("type"), Some("0"), "directories have type 0");
+
+    // Empty directories delete like files.
+    session.delete_file(&channel, "/univox_dir").await.expect("cleanup");
+    session.disconnect(None).await.ok();
+}

@@ -70,6 +70,20 @@
   验收：`cargo check -p univox-ts3 --no-default-features` 通过、
   `cargo tree` 无 audiopus、默认构建与 `cargo test --workspace` 不变。
 
+### 二轮反馈（身份回写 / counter 语义 / create_dir）
+
+- **`Ts3Session::identity() -> &Identity`**：connect（含
+  `upgrade_identity_to` 升级）后的最终身份可读回；调用方应在连接后持久化
+  `counter()`/`max_counter()`（hash-cash 搜索从 max_counter 续起，等级可能
+  被服务器上调）。
+- **counter 复用语义确认**：`client_key_offset` 是工作量证明标记而非
+  服务端消耗的 nonce——tsclientlib 0.2 从不按次递增（直接发送
+  `identity.counter()`），真机验证同一身份/counter 连续两次连接均成功；
+  重连 supervisor 无需递增。等级被上调的场景由 connect 侧
+  `upgrade_identity_to` 覆盖（真机验证：提升到 14 后无升级被拒、有升级通过）。
+- **`Ts3Ext::create_dir(channel, path, password)`**（`ftcreatedir`，参数名
+  为 `dirname`）。
+
 ### 测试
 
 - 单元：book 映射（poke/left-reason/extra fixture）、identity JSON 往返、
