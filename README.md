@@ -5,7 +5,7 @@
 Univox 把多个语音平台的协议实现收敛到**一套 Rust API** 之下：同一个机器人/客户端程序可以用统一的模型（服务器、频道、成员、消息、语音流、事件）同时驱动多个平台会话，而不用为每个平台学一套 SDK。
 
 **当前状态：TeamSpeak 3 驱动完成并经真实服务器（3.13.8）验收（96 个测试
-全绿：单元 + 协议向量 + 集成）；KOOK / OOPZ 仍为规划。** 完整功能列表见
+全绿：单元 + 协议向量 + 集成）；KOOK / OOPZ / Discord 仍为规划。** 完整功能列表见
 **[docs/FEATURES.md](docs/FEATURES.md)**。
 
 ## TeamSpeak 3 已交付能力
@@ -58,11 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | TeamSpeak 3 | 原生客户端协议（UDP）+ ServerQuery 管理接口 | **已完成** |
 | KOOK | 官方 Bot API（REST + WebSocket + RTP 音频推流） | 规划中 |
 | OOPZ | 社区逆向协议（REST + WebSocket + Agora RTC 桥） | 规划中 |
+| Discord | 官方 Bot API（Gateway WebSocket + REST + 语音 UDP，DAVE 端到端加密） | 规划中 |
 | TeamSpeak 6 | 无公开 SDK；语音线路与 TS3 兼容 | 未来项 |
 
 ## 设计要点
 
-- **统一 API + 插件式平台驱动**：平台差异用能力声明（capabilities）与平台扩展层（`Ts3Ext` / `KookExt` / `OopzExt`）隔离。
+- **统一 API + 插件式平台驱动**：平台差异用能力声明（capabilities）与平台扩展层（`Ts3Ext` / `KookExt` / `OopzExt` / `DiscordExt`）隔离。
 - **Rust 编译为动态库**：核心为 Rust 实现，以 C ABI（`cdylib` → `.so` / `.dll`）交付，Python / C# / Java 等语言经 FFI 绑定复用同一份实现。
 - **状态簿记**：内存镜像服务器状态（频道树/成员/角色），属性级变更事件驱动。
 - **统一事件总线**：平台事件统一映射，未映射事件经 `RawEvent` 透传。
