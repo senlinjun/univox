@@ -8,3 +8,4 @@ Cargo.lock.orig
 /test/teamspeak3-server/teamspeak3-server_linux_amd64/.ts3server_license_accepted
 /test/teamspeak3-server/teamspeak3-server_linux_amd64/query_ip_blacklist.txt
 /test/teamspeak3-server/teamspeak3-server_linux_amd64/query_ip_whitelist.txt
+.zcode
