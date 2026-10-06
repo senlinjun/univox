@@ -169,6 +169,9 @@ pub struct Ts3Session {
     ftfid: std::sync::atomic::AtomicU32,
     /// Cached own uid (resolved lazily for avatar management).
     own_uid: std::sync::Mutex<Option<String>>,
+    /// Last applied runtime self state, replayed after reconnects
+    /// (FEATURES.md §2.4: mutes/away/commander survive a resume).
+    pub(crate) last_self_update: std::sync::Mutex<Option<crate::ext::SelfUpdate>>,
     /// Kept for reconnects.
     connect_options: ConnectOptions,
     identity: Identity,
@@ -214,6 +217,7 @@ impl Ts3Session {
             receiving: std::sync::Mutex::new(None),
             ftfid: std::sync::atomic::AtomicU32::new(1),
             own_uid: std::sync::Mutex::new(None),
+            last_self_update: std::sync::Mutex::new(None),
             connect_options: opts,
             identity,
             shutdown: shutdown_tx,
@@ -352,6 +356,13 @@ impl Ts3Session {
                                 .param("cid", channel.as_u64().unwrap_or(0)),
                         )
                         .await;
+                }
+                // Replay the last runtime self state (clientupdate is
+                // idempotent); input/output muted additionally ride every
+                // clientinit via the reused handshake options.
+                let replay = self.last_self_update.lock().unwrap().clone();
+                if let Some(update) = replay {
+                    let _ = new_conn.exec(update.into_command()).await;
                 }
             }
 
@@ -672,9 +683,16 @@ impl Session for Ts3Session {
         .await
     }
 
-    async fn join_voice(&self, channel: &ChannelId, _password: Option<&str>) -> Result<()> {
-        self.move_member(&MemberId::from_u64(u64::from(self.clid())), channel)
-            .await
+    async fn join_voice(&self, channel: &ChannelId, password: Option<&str>) -> Result<()> {
+        // clientmove carries an optional `cpw` (base64(sha1)) for
+        // password-protected target channels.
+        let mut cmd = Command::new("clientmove")
+            .param("clid", u64::from(self.clid()))
+            .param("cid", channel.as_u64().unwrap_or(0));
+        if let Some(pw) = password {
+            cmd = cmd.param("cpw", hash_password(pw));
+        }
+        self.exec_ok(cmd).await
     }
 
     async fn leave_voice(&self) -> Result<()> {

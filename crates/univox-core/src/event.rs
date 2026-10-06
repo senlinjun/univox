@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 
 use crate::id::{ChannelId, MemberId};
 use crate::model::{
-    Channel, DisconnectReason, Member, MemberLeftReason, Message, Server,
+    Channel, ClientMoveReason, DisconnectReason, Member, MemberLeftReason, Message, Server,
 };
 
 /// An unmapped platform event, passed through verbatim (G3: no information
@@ -87,7 +87,14 @@ pub enum Event {
     TextMuteChanged { member: MemberId, muted: bool },
     VoiceMuteChanged { member: MemberId, muted: bool },
     /// Member moved by an admin.
-    ClientMoved { member: MemberId, channel: ChannelId, invoker: Option<MemberId> },
+    /// `reasonid`/`reasonmsg` preserved — a channel kick arrives on this
+    /// same notification as `ClientMoveReason::ChannelKicked`.
+    ClientMoved {
+        member: MemberId,
+        channel: ChannelId,
+        invoker: Option<MemberId>,
+        reason: ClientMoveReason,
+    },
 
     /// TS3: plugin command relay (Ext, FEATURES.md §11.1).
     PluginCommandReceived { member: Option<MemberId>, payload: Vec<u8>, target: PluginCommandTarget },

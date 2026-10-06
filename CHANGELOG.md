@@ -84,6 +84,22 @@
 - **`Ts3Ext::create_dir(channel, path, password)`**（`ftcreatedir`，参数名
   为 `dirname`）。
 
+### 三轮反馈（重连自状态 / ClientMoved reason / 传输密码 / join_voice）
+
+- **重连恢复自身状态**：`update_self` 应用过的最后一份运行时状态（away、
+  指挥官、徽章等）在重连成功后自动重放（`restore_state` 开启时）；
+  input/output muted 本就随 clientinit 重发。`ReconnectPolicy.restore_state`
+  文档同步对齐（明确不恢复频道订阅及原因）。
+- **破坏性变更：`Event::ClientMoved` 增加 `reason: ClientMoveReason`**。
+  真机抓包（3.13.8）：频道踢对被踢者以 `notifyclientmoved reasonid=4`
+  + `reasonmsg` + invoker 到达（移动为 reasonid=1），此前被整行丢弃、
+  无法区分「被踢」与「被移动」。`ClientMoveReason`：Moved /
+  ChannelKicked{by,message} / Other(raw)。
+- **破坏性变更（trait 签名）**：`list_files` / `delete_file` 增加
+  `password: Option<&str>`（明文、内部哈希），密码频道不再需要 exec 兜底。
+- **`join_voice` 不再忽略 password**：`clientmove` 支持可选 `cpw`
+  （base64(sha1)），真机验证正反例。
+
 ### 测试
 
 - 单元：book 映射（poke/left-reason/extra fixture）、identity JSON 往返、

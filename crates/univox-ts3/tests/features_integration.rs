@@ -73,7 +73,7 @@ async fn streaming_upload_download_roundtrip() {
     // password on another channel — use the same channel with an empty
     // password explicitly.
     session
-        .delete_file(&channel, "/univox_stream.bin")
+        .delete_file(&channel, "/univox_stream.bin", None)
         .await
         .expect("cleanup");
     session.disconnect(None).await.ok();
@@ -99,7 +99,7 @@ async fn streaming_upload_abort_discards_partial_file() {
     let mut gone = false;
     let mut last_listing = Vec::new();
     while tokio::time::Instant::now() < deadline {
-        let listing = session.list_files(&channel, "/").await.expect("list");
+        let listing = session.list_files(&channel, "/", None).await.expect("list");
         if listing
             .iter()
             .all(|r| r.get("name").map(|n| n.trim_start_matches('/')) != Some("univox_aborted.bin"))
@@ -498,7 +498,7 @@ async fn create_dir_shows_in_listing() {
     let channel = ChannelId::from_u64(1);
 
     session.create_dir(&channel, "/univox_dir", None).await.expect("ftcreatedir");
-    let listing = session.list_files(&channel, "/").await.expect("list");
+    let listing = session.list_files(&channel, "/", None).await.expect("list");
     let entry = listing
         .iter()
         .find(|r| r.get("name").map(|n| n.trim_start_matches('/')) == Some("univox_dir"))
@@ -506,6 +506,243 @@ async fn create_dir_shows_in_listing() {
     assert_eq!(entry.get("type"), Some("0"), "directories have type 0");
 
     // Empty directories delete like files.
-    session.delete_file(&channel, "/univox_dir").await.expect("cleanup");
+    session.delete_file(&channel, "/univox_dir", None).await.expect("cleanup");
+    session.disconnect(None).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_moved_carries_kick_reason() {
+    // Live-captured on 3.13.8: the moved client receives
+    // `notifyclientmoved reasonid=1` for a move and `reasonid=4` +
+    // `reasonmsg` + invoker for a channel kick — both mapped onto
+    // Event::ClientMoved with a structured reason.
+    use univox_core::id::MemberId;
+    use univox_core::model::{ChannelOptions, ClientMoveReason, Permanence};
+    let server = spawn_server().await;
+    let a = spawn_admin("Admin", &server).await;
+    let b = connect_as(&server, "Victim").await;
+    let a_id = MemberId::from_u64(univox_ts3::self_clid(&a));
+    let mut events = b.events();
+
+    let ch = a
+        .create_channel(ChannelOptions {
+            name: "KickMe".into(),
+            parent: Some(ChannelId::from_u64(1)),
+            permanence: Permanence::SemiPermanent,
+            ..Default::default()
+        })
+        .await
+        .expect("create");
+    a.move_member(&MemberId::from_u64(univox_ts3::self_clid(&b)), &ch)
+        .await
+        .expect("move victim in");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    a.kick_member(
+        &MemberId::from_u64(univox_ts3::self_clid(&b)),
+        true,
+        Some("out you go"),
+    )
+    .await
+    .expect("kick");
+
+    let mut moved = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), events.next()).await {
+            Ok(Some(ev)) => {
+                if let Event::ClientMoved { reason, .. } = &*ev {
+                    moved.push(reason.clone());
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        moved.iter().any(|r| matches!(r, ClientMoveReason::Moved)),
+        "move reason missing: {moved:?}"
+    );
+    assert!(
+        moved.iter().any(|r| matches!(
+            r,
+            ClientMoveReason::ChannelKicked { by, message }
+                if *by == Some(a_id.clone()) && message == "out you go"
+        )),
+        "kick reason missing: {moved:?}"
+    );
+    a.disconnect(None).await.ok();
+    b.disconnect(None).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_restores_self_state() {
+    use test_support::{Ts3Server, Ts3ServerOptions};
+    use univox_ts3::ext::Ts3Ext as _;
+
+    let voice_port = {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let server_a = Ts3Server::start_with(Ts3ServerOptions {
+        voice_port: Some(voice_port),
+        ..Default::default()
+    })
+    .await
+    .expect("boot A");
+    let addr = format!("127.0.0.1:{voice_port}");
+    // A patient policy: under full-suite load server B boots slower than
+    // the default attempt budget.
+    let policy = univox_core::connect::ReconnectPolicy {
+        max_attempts: 20,
+        base_delay: Duration::from_millis(200),
+        max_delay: Duration::from_secs(2),
+        jitter: 0.0,
+        restore_state: true,
+    };
+    let mut opts = ConnectOptions::new(addr.clone())
+        .nickname("Phoenix")
+        .credential(Credential::Anonymous);
+    opts.reconnect = policy;
+    let session = Ts3Session::connect(opts, Identity::create())
+        .await
+        .expect("connect");
+
+    session
+        .update_self(univox_ts3::SelfUpdate {
+            away: Some(true),
+            away_message: Some("brb".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("away");
+
+    let mut events = session.events();
+    drop(server_a);
+    let server_b = Ts3Server::start_with(Ts3ServerOptions {
+        voice_port: Some(voice_port),
+        ..Default::default()
+    })
+    .await
+    .expect("boot B");
+    let _keep = server_b;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    let mut reconnected = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), events.next()).await {
+            Ok(Some(ev)) if matches!(&*ev, Event::Reconnected) => {
+                reconnected = true;
+                break;
+            }
+            Ok(Some(_)) | Ok(None) | Err(_) => {}
+        }
+    }
+    assert!(reconnected, "no Reconnected event");
+
+    // The replayed clientupdate echoes back as notifyclientupdated, which
+    // the book mirror records (works for guests — no clientlist needed).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut restored = None;
+    while tokio::time::Instant::now() < deadline {
+        let me = univox_core::id::MemberId::from_u64(univox_ts3::self_clid(&session));
+        if let Some(st) = session.book().member_state(&me) {
+            if st.away {
+                restored = Some(st);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let st = restored.expect("away state not restored after reconnect");
+    assert_eq!(st.away_message.as_deref(), Some("brb"));
+    session.disconnect(None).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn passworded_channel_transfer_and_join() {
+    use univox_core::model::{ChannelOptions, Permanence};
+    let server = spawn_server().await;
+    let session = spawn_admin("PwOps", &server).await;
+
+    let ch = session
+        .create_channel(ChannelOptions {
+            name: "Vault".into(),
+            parent: Some(ChannelId::from_u64(1)),
+            permanence: Permanence::SemiPermanent,
+            password: Some("chpw".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("create passworded channel");
+
+    // Upload + list + download + delete with the channel password
+    // (plaintext, hashed internally).
+    let payload = b"secret payload".to_vec();
+    let mut up = session
+        .upload_file_stream(&ch, "/secret.txt", payload.len() as u64, Some("chpw"))
+        .await
+        .expect("upload stream");
+    up.write_chunk(&payload).await.expect("write");
+    up.finish().await.expect("finish");
+
+    let listing = session
+        .list_files(&ch, "/", Some("chpw"))
+        .await
+        .expect("list with password");
+    assert!(
+        listing
+            .iter()
+            .any(|r| r.get("name").map(|n| n.trim_start_matches('/')) == Some("secret.txt")),
+        "file missing: {listing:?}"
+    );
+
+    let mut dl = session
+        .download_file_stream(&ch, "/secret.txt", Some("chpw"))
+        .await
+        .expect("download stream");
+    let mut got = Vec::new();
+    while let Some(chunk) = dl.next_chunk().await.expect("chunk") {
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, payload);
+
+    session
+        .delete_file(&ch, "/secret.txt", Some("chpw"))
+        .await
+        .expect("delete with password");
+    let listing = session
+        .list_files(&ch, "/", Some("chpw"))
+        .await
+        .expect("list after delete");
+    assert!(
+        listing
+            .iter()
+            .all(|r| r.get("name").map(|n| n.trim_start_matches('/')) != Some("secret.txt")),
+        "file not deleted: {listing:?}"
+    );
+
+    // join_voice with the channel password: cpw rides clientmove.
+    session
+        .join_voice(&ch, Some("chpw"))
+        .await
+        .expect("join with password");
+    let me = univox_ts3::self_clid(&session);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut joined = false;
+    while tokio::time::Instant::now() < deadline && !joined {
+        joined = session.book().members().iter().any(|m| {
+            m.id.as_u64() == Some(me)
+                && m.channel_id.as_ref().and_then(|c| c.as_u64()) == ch.as_u64()
+        });
+        if !joined {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    assert!(joined, "join_voice with password did not move us into the channel");
+
+    // Wrong password: refused.
+    assert!(
+        session.join_voice(&ch, Some("wrong")).await.is_err(),
+        "wrong channel password must be refused"
+    );
     session.disconnect(None).await.ok();
 }

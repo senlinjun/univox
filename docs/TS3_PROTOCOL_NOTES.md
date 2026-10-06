@@ -168,3 +168,8 @@ TS6 适配参考。
   就地 `upgrade_level` 后重连。因此身份必须在连接后回写持久化
   （counter/max_counter），保证升级搜索不回退、等级不退步。
 - **ftcreatedir 的路径参数名是 `dirname`**（不是 `path`）。
+- **频道踢的到达形态**：被踢客户端收到 `notifyclientmoved reasonid=4`
+  （带 `reasonmsg`、`invokerid/invokername/invokeruid`，落到默认频道）；
+  旁观者收到的是 `clientleftview reasonid=4` + enterview。
+  `notifyclientmoved` 的 reasonid 同样遵循 `Reason` 枚举（1=Moved）。
+- **clientmove 支持可选 `cpw`**（base64(sha1)）：切入密码频道用。

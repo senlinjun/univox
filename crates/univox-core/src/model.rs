@@ -270,6 +270,21 @@ pub enum MemberLeftReason {
     Other(String),
 }
 
+/// Why a member changed channel (FEATURES.md §4). TS3's `notifyclientmoved`
+/// carries the same reason ids as the leave view — a channel kick surfaces
+/// here with the invoker and message attached (verified on 3.13.8).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientMoveReason {
+    /// Moved (TS3 reasonid 1) — by an invoker, or the echo of a
+    /// self-initiated move (compare with the event's `invoker`).
+    Moved,
+    /// Kicked out of the previous channel (TS3 reasonid 4).
+    ChannelKicked { by: Option<MemberId>, message: String },
+    /// Anything else — carries the raw platform encoding (e.g.
+    /// `reasonid=10`).
+    Other(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

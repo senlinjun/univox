@@ -17,7 +17,10 @@ pub struct ReconnectPolicy {
     pub base_delay: Duration,
     pub max_delay: Duration,
     pub jitter: f64,
-    /// Re-establish prior state (channel, mutes, subscriptions) after resume.
+    /// Re-establish prior state after resume: the previous channel and the
+    /// last runtime self state (mutes, away, commander flags applied via
+    /// `update_self`). Channel subscriptions are not restored — TS3
+    /// re-subscribes the default set on a fresh connect.
     pub restore_state: bool,
 }
 

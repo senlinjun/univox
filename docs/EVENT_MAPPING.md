@@ -22,7 +22,7 @@
 |---|---|---|
 | notifycliententerview | MemberJoined / MemberUpdated | `ctid` 为目标频道 |
 | notifyclientleftview / notifyclientdisconnect | MemberLeft（结构化 MemberLeftReason） | 移除 member/state；reasonid 1/4/5/6/8/… 映射见 model.rs，未识别的保留 `Other("reasonid=N")` |
-| notifyclientmoved | ClientMoved | `ctid` 新频道 |
+| notifyclientmoved | ClientMoved | `ctid` 新频道；invoker + 结构化 reason（1=Moved，4=ChannelKicked{by,message}——频道踢对被踢者走此通知） |
 | notifyclientupdated | MemberUpdated | **增量行**：空 nickname 不覆盖已有值，extra 合并 |
 | notifytextmessage | MessageCreated | targetmode 1/2/3 → Direct/Channel/Server |
 | notifyclientpoke | MessageCreated | target=Poke(invoker)、author=invoker，便于原样回戳 |

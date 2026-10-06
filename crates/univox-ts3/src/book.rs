@@ -4,8 +4,8 @@
 use univox_core::event::{Event, RawEvent};
 use univox_core::id::{ChannelId, MemberId, MessageId};
 use univox_core::model::{
-    Channel, ChannelKind, HostMessageMode, Member, MemberLeftReason, MemberState, Message,
-    MessageTarget, OnlineState, Permanence, Server, VoiceState,
+    Channel, ChannelKind, ClientMoveReason, HostMessageMode, Member, MemberLeftReason,
+    MemberState, Message, MessageTarget, OnlineState, Permanence, Server, VoiceState,
 };
 use univox_core::platform::Platform;
 use univox_ts3_proto::{Command, RowExt};
@@ -244,6 +244,18 @@ pub fn apply_to_book(
                 // carries theirs. Consumers classify self-moves vs forced
                 // moves from this, so it must not be dropped.
                 let invoker = get("invokerid").map(member_id);
+                // reasonid follows the tsdeclarations `Reason` enum: 1 =
+                // moved, 4 = kicked from the channel (with reasonmsg +
+                // invoker attached — this is how the kicked client learns
+                // why, verified on 3.13.8).
+                let reason = match get("reasonid").unwrap_or("1") {
+                    "1" => ClientMoveReason::Moved,
+                    "4" => ClientMoveReason::ChannelKicked {
+                        by: invoker.clone(),
+                        message: get("reasonmsg").unwrap_or("").to_string(),
+                    },
+                    other => ClientMoveReason::Other(format!("reasonid={other}")),
+                };
                 book.with_mut(|b| {
                     if let Some(m) = b.members.get_mut(&id) {
                         m.channel_id = Some(new_channel.clone());
@@ -256,6 +268,7 @@ pub fn apply_to_book(
                     member: id,
                     channel: new_channel,
                     invoker,
+                    reason,
                 });
             }
             events

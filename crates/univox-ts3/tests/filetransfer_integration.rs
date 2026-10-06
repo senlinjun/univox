@@ -38,7 +38,7 @@ async fn file_transfer_roundtrip() {
     up.expect("upload");
 
     // The file shows up in the listing.
-    let listing = session.list_files(&channel, "/").await.expect("ftgetfilelist");
+    let listing = session.list_files(&channel, "/", None).await.expect("ftgetfilelist");
     // The server strips the leading slash in the listing.
     assert!(
         listing
@@ -55,10 +55,10 @@ async fn file_transfer_roundtrip() {
     assert_eq!(downloaded, payload, "content mismatch");
 
     session
-        .delete_file(&channel, "/univox_test.bin")
+        .delete_file(&channel, "/univox_test.bin", None)
         .await
         .expect("ftdeletefile");
-    let listing = session.list_files(&channel, "/").await.expect("ftgetfilelist");
+    let listing = session.list_files(&channel, "/", None).await.expect("ftgetfilelist");
     assert!(
         listing
             .iter()
@@ -91,7 +91,7 @@ async fn avatar_upload_and_download() {
     session.upload_avatar(&png).await.expect("avatar upload");
 
     // How did the server store it? (the uid may contain path separators)
-    let root = session.list_files(&ChannelId::from_u64(0), "/").await.expect("root listing");
+    let root = session.list_files(&ChannelId::from_u64(0), "/", None).await.expect("root listing");
     println!("ROOT: {root:?}");
 
     let downloaded = session.download_avatar(&dbid).await.expect("avatar after");

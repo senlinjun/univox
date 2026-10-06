@@ -68,7 +68,7 @@ pub struct SelfUpdate {
 }
 
 impl SelfUpdate {
-    fn into_command(self) -> Command {
+    pub(crate) fn into_command(self) -> Command {
         let mut cmd = Command::new("clientupdate");
         let flag = |cmd: Command, key: &str, v: Option<bool>| {
             if let Some(v) = v {
@@ -198,8 +198,13 @@ pub trait Ts3Ext: Session {
     // ---- file transfer (§11) ----
 
     /// List the files of a channel's root (or `path` subdirectory).
-    async fn list_files(&self, channel: &univox_core::id::ChannelId, path: &str)
-        -> Result<Vec<Row>>;
+    /// `password` is the channel password, plaintext — hashed internally.
+    async fn list_files(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        path: &str,
+        password: Option<&str>,
+    ) -> Result<Vec<Row>>;
     /// Upload `data` as `name` (e.g. `/univox_test.txt`) into `channel`.
     async fn upload_file(
         &self,
@@ -245,10 +250,14 @@ pub trait Ts3Ext: Session {
         path: &str,
         password: Option<&str>,
     ) -> Result<()>;
+    /// Delete the file `name` from `channel` (also removes empty
+    /// directories). `password` is the channel password, plaintext —
+    /// hashed internally.
     async fn delete_file(
         &self,
         channel: &univox_core::id::ChannelId,
         name: &str,
+        password: Option<&str>,
     ) -> Result<()>;
     /// The client's avatar bytes, if one is set (None = no avatar).
     async fn download_avatar(&self, db_id: &DbId) -> Result<Option<Vec<u8>>>;
@@ -580,6 +589,8 @@ impl Ts3Ext for Ts3Session {
     }
 
     async fn update_self(&self, update: SelfUpdate) -> Result<()> {
+        // Remember for the reconnect replay (supervisor, restore_state).
+        *self.last_self_update.lock().unwrap() = Some(update.clone());
         self.exec_ok(update.into_command()).await
     }
 
@@ -666,16 +677,18 @@ impl Ts3Ext for Ts3Session {
         &self,
         channel: &univox_core::id::ChannelId,
         path: &str,
+        password: Option<&str>,
     ) -> Result<Vec<Row>> {
         // This server requires `cpw` (empty) along with path, and answers
         // AFTER the error packet with `notifyfilelist` rows terminated by
         // `notifyfilelistfinished`.
+        let cpw = password.map(hash_password).unwrap_or_default();
         let mut notifications = self.conn().subscribe();
         if let Err(Error::Platform { code: 1281, .. } | Error::Platform { code: 2054, .. }) = self
             .exec(
                 Command::new("ftgetfilelist")
                     .param("cid", channel.as_u64().unwrap_or(0))
-                    .param("cpw", "")
+                    .param("cpw", cpw)
                     .param("path", path),
             )
             .await
@@ -777,11 +790,13 @@ impl Ts3Ext for Ts3Session {
         &self,
         channel: &univox_core::id::ChannelId,
         name: &str,
+        password: Option<&str>,
     ) -> Result<()> {
+        let cpw = password.map(hash_password).unwrap_or_default();
         self.exec_ok(
             Command::new("ftdeletefile")
                 .param("cid", channel.as_u64().unwrap_or(0))
-                .param("cpw", "")
+                .param("cpw", cpw)
                 .param("name", name),
         )
         .await
