@@ -1094,6 +1094,7 @@ impl Actor {
         let now = Instant::now();
         let mut to_send: Vec<Vec<u8>> = Vec::new();
         let mut give_up = false;
+        let mut stuck: Vec<String> = Vec::new();
         for p in &mut self.pending {
             let elapsed = now.duration_since(p.last_sent);
             let delay = Duration::from_millis(350u64 << p.resends.min(6));
@@ -1106,6 +1107,7 @@ impl Actor {
                 }
             }
             if p.resends >= 12 {
+                stuck.push(format!("{:?} p_id={} resends={}", p.p_type, p.p_id, p.resends));
                 give_up = true;
             }
         }
@@ -1114,7 +1116,11 @@ impl Actor {
             self.send_udp(d);
         }
         if give_up {
-            tracing::warn!("client packet never acknowledged");
+            tracing::warn!(
+                "client packet never acknowledged: {:?} ({} pending left)",
+                stuck,
+                self.pending.len()
+            );
             return Err(Error::Timeout);
         }
 
@@ -1376,8 +1382,13 @@ impl Actor {
     }
 
     fn remove_pending(&mut self, p_type: PacketType, p_id: u16) {
+        // Ack contents run cumulatively (a received packet acks everything
+        // the peer has contiguous up to its id — the semantics the voicecore
+        // rewrite validated against captures). Exact-match removal here
+        // stranded entries whose ack never echoed their id verbatim, and
+        // every stranded entry killed the connection after 12 resends.
         self.pending
-            .retain(|p| !(p.p_type == p_type && p.p_id == p_id));
+            .retain(|p| !(p.p_type == p_type && p.p_id <= p_id));
     }
 
     fn dispatch_command(&mut self, shared: &ActorShared, cmd: Command) {
