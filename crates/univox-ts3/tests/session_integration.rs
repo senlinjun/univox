@@ -7,8 +7,8 @@ use univox_core::event::Event;
 use univox_core::model::{MessageTarget, Permanence};
 use univox_core::session::{Session, SessionManager};
 use univox_core::{ChannelOptions, ConnectOptions, Credential};
-use univox_ts3::{Ts3Driver, Ts3Session};
-use univox_ts3_proto::Identity;
+use univox_ts3::{Ts3ConnectOptions, Ts3Driver, Ts3Session};
+use univox_ts3_proto::{Command, Identity, RowExt};
 
 async fn spawn_session(nickname: &str) -> (Ts3Server, std::sync::Arc<Ts3Session>) {
     let server = Ts3Server::start().await.expect("boot");
@@ -204,4 +204,64 @@ async fn session_manager_routes_ts3() {
     assert!(manager.sessions().len() == 1);
 
     session.disconnect(Some("bye".to_string())).await.ok();
+}
+
+/// Regression: with `-away`, the clientlist response rows lead with a bare
+/// `client_away_message` key whenever no listed client is away (the server
+/// omits the `=` for empty values). The wire parser then mistakes the bare
+/// key for a command name, the rows failed the response-name match, and the
+/// dump came back as `Ok` with zero rows — the roster stayed empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_clientlist_away_dump_populates_roster() {
+    let server = Ts3Server::start().await.expect("boot");
+    let addr = format!("127.0.0.1:{}", server.voice_port);
+
+    // Guests lack the view permission (permid 27), so take the admin token
+    // at connect — prime_book's clientlist fires inside connect().
+    let opts = ConnectOptions::new(addr)
+        .nickname("Roster Bot")
+        .credential(Credential::Anonymous)
+        .bookkeeping(univox_core::BookkeepingConfig {
+            enabled: true,
+            member_states: true,
+        })
+        .with_extension(Ts3ConnectOptions {
+            privilege_key: Some(server.admin_token.clone()),
+            ..Default::default()
+        });
+    let session = Ts3Session::connect(opts, Identity::create())
+        .await
+        .expect("connect");
+
+    // The dump ran inside connect: the self row must reach the book.
+    let mut self_in_roster = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !self_in_roster {
+        self_in_roster = session
+            .book()
+            .members()
+            .iter()
+            .any(|m| m.nickname == "Roster Bot");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(self_in_roster, "clientlist dump left the roster empty");
+
+    // The same command by hand must return rows, not an empty Ok.
+    let rows = session
+        .exec(
+            Command::new("clientlist")
+                .opt("uid")
+                .opt("away")
+                .opt("voice")
+                .opt("groups"),
+        )
+        .await
+        .expect("clientlist");
+    let clid = univox_ts3::self_clid(&session).to_string();
+    assert!(
+        rows.iter().any(|r| r.get("clid") == Some(clid.as_str())),
+        "clientlist returned no rows for self"
+    );
+
+    session.disconnect(Some("done".to_string())).await.ok();
 }

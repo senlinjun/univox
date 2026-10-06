@@ -577,6 +577,23 @@ fn start_pump(
 /// Fill the book from a full-sync dump (no events — initial state, not a
 /// transition).
 fn apply_dump(core: &SessionCore, name: &str, rows: crate::client::Rows, clid: u16) {
+    if name == "clientlist" {
+        let self_clid_str = clid.to_string();
+        let self_row = rows
+            .iter()
+            .find(|r| r.iter().any(|(k, v)| k == "clid" && *v == self_clid_str));
+        let self_cid = self_row.and_then(|r| {
+            r.iter()
+                .find(|(k, _)| k == "cid")
+                .map(|(_, v)| v.clone())
+        });
+        tracing::info!(
+            rows = rows.len(),
+            self_present = self_row.is_some(),
+            self_cid = ?self_cid,
+            "clientlist dump"
+        );
+    }
     let mut dump = Command::new(name);
     dump.params = rows;
     for ev in apply_to_book(&core.book, u64::from(clid), &dump, crate::book::StreamOrigin::Client) {
@@ -592,7 +609,7 @@ async fn prime_book(core: &Arc<SessionCore>, conn: &Arc<UdpConnection>, clid: u1
     if !core.book.enabled() {
         return;
     }
-    if let Ok(rows) = conn
+    match conn
         .exec(
             Command::new("clientlist")
                 .opt("uid")
@@ -602,7 +619,14 @@ async fn prime_book(core: &Arc<SessionCore>, conn: &Arc<UdpConnection>, clid: u1
         )
         .await
     {
-        apply_dump(core, "clientlist", rows, clid);
+        Ok(rows) => apply_dump(core, "clientlist", rows, clid),
+        // Permission-restricted servers (plain guests) deny the bulk dump —
+        // the roster then only grows with own-channel occupants. Make the
+        // denial visible instead of silently degrading.
+        Err(e) => tracing::warn!(
+            error = %e,
+            "clientlist dump denied; roster limited to own-channel occupants"
+        ),
     }
 }
 

@@ -86,6 +86,7 @@ TS6 适配参考。
 | ftinitdownload        | notifystartdownload / notifystatusfiletransfer（失败） |
 | whoami 等             | 无名（首字段即数据）      |
 | clientdbinfo          | 无名，但首字段 `client_flag_avatar` 为空值裸键，易被当成命令名 |
+| clientlist -away      | 无名，但**无人在离开状态时**首字段 `client_away_message` 为空值裸键，同样易被当成命令名 |
 
 连接层据此做精确路由：响应行发给等待中的 exec（同时仍广播给簿记泵）。
 
@@ -153,6 +154,10 @@ TS6 适配参考。
 - **clientdbinfo 的响应行没有可靠的名字**：行首的空字段会被解析器当成
   命令名（无头像时是 `client_flag_avatar`；设置头像后变成下一个空字段，
   如 `client_description`）。识别标准改为"行内含 client_database_id"。
+- **clientlist -away 同型陷阱**：列表里无人处于离开状态时，响应行首是
+  空值裸键 `client_away_message`，会被当成命令名 → exec 返回 `Ok(空)`
+  而非报错，花名册静默变空。识别标准改为"行内含 clid"（连接层，
+  `is_response_name` 的 clientlist 分支）。
 - **clientupdate client_flag_avatar=<md5hex>**：文件必须已上传，否则
   报 2051（file not found）；值是头像文件的小写 hex MD5。
 - **serveredit 设置服务器密码**：只发 `virtualserver_password=…` 即可

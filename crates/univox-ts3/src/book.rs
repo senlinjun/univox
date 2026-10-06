@@ -263,6 +263,12 @@ pub fn apply_to_book(
                     if let Some(vs) = b.voice_states.get_mut(&id) {
                         vs.channel_id = Some(new_channel.clone());
                     }
+                    // The self mirror feeds the reconnect channel restore —
+                    // keep it in step or a resume would move us back to the
+                    // initserver-time channel.
+                    if b.self_member.member_id.as_ref() == Some(&id) {
+                        b.self_member.channel_id = Some(new_channel.clone());
+                    }
                 });
                 events.push(Event::ClientMoved {
                     member: id,
@@ -447,14 +453,48 @@ fn apply_initserver(book: &univox_core::Book, self_clid: u64, cmd: &Command) -> 
         extra,
         ..Default::default()
     };
+    // `0` means "not reported" — treat it like an absent key so the
+    // channellist default-channel fallback can fill the real channel in.
     let channel_id_of_self = get("client_channel_id")
         .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v != 0)
         .map(ChannelId::from_u64);
     book.with_mut(|b| {
         b.server = Some(server);
         b.self_member.member_id = Some(MemberId::from_u64(self_clid));
-        b.self_member.channel_id = channel_id_of_self;
         b.self_member.nickname = get("client_nickname").unwrap_or("").to_string();
+        // Seed the self member into the roster — but never clobber what the
+        // login dump already reported: the server's own enterview for us is
+        // more specific than initserver (whose client_channel_id may be 0
+        // or absent, depending on the server).
+        let id = MemberId::from_u64(self_clid);
+        match b.members.get_mut(&id) {
+            Some(m) => {
+                if m.channel_id.is_none() {
+                    m.channel_id = channel_id_of_self.clone();
+                }
+            }
+            None => {
+                b.members.insert(
+                    id.clone(),
+                    Member {
+                        id: id.clone(),
+                        nickname: get("client_nickname").unwrap_or("").to_string(),
+                        channel_id: channel_id_of_self.clone(),
+                        extra: cmd
+                            .params
+                            .first()
+                            .map(|row| row.iter().cloned().collect())
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // The mirror follows the roster entry when initserver has nothing.
+        if b.self_member.channel_id.is_none() {
+            b.self_member.channel_id = b.members.get(&id).and_then(|m| m.channel_id.clone());
+        }
     });
     Vec::new()
 }
@@ -532,6 +572,42 @@ mod tests {
         let events = apply_to_book(&b, 1, &left, StreamOrigin::Client);
         assert!(events.iter().any(|e| matches!(e, Event::MemberLeft { .. })));
         assert!(b.member(&5u64.into()).is_none());
+    }
+
+    #[test]
+    fn initserver_seeds_self_member() {
+        let b = book();
+        let cmd = Command::parse(
+            "virtualserver_id=1 virtualserver_name=Test virtualserver_clientsonline=2 \
+             virtualserver_maxclients=32 virtualserver_version=3.13.8 \
+             client_channel_id=7 client_nickname=Me",
+        )
+        .unwrap();
+        let events = apply_to_book(&b, 5, &cmd, StreamOrigin::Client);
+        assert!(events.is_empty());
+        // The self member lands in the roster with its channel — servers
+        // where the clientlist dump is denied never report our enterview.
+        let me = b.member(&5u64.into()).expect("self member in roster");
+        assert_eq!(me.nickname, "Me");
+        assert_eq!(me.channel_id, Some(7u64.into()));
+        let self_channel = b.with(|inner| inner.self_member.channel_id.clone());
+        assert_eq!(self_channel, Some(Some(7u64.into())));
+    }
+
+    #[test]
+    fn clientmoved_updates_self_mirror() {
+        let b = book();
+        let init = Command::parse(
+            "virtualserver_id=1 virtualserver_name=Test \
+             client_channel_id=1 client_nickname=Me",
+        )
+        .unwrap();
+        apply_to_book(&b, 5, &init, StreamOrigin::Client);
+        let cmd = Command::parse("notifyclientmoved clid=5 ctid=9 reasonid=1").unwrap();
+        let events = apply_to_book(&b, 5, &cmd, StreamOrigin::Client);
+        assert!(matches!(events[0], Event::ClientMoved { .. }));
+        let self_channel = b.with(|inner| inner.self_member.channel_id.clone());
+        assert_eq!(self_channel, Some(Some(9u64.into())));
     }
 
     #[test]

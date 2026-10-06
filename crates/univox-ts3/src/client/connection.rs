@@ -977,6 +977,7 @@ impl Actor {
         let code = self.cur_return_code;
         self.cur_return_code += 1;
         let cmd = cmd.param("return_code", code);
+        tracing::debug!(name = %cmd.name, return_code = code, "exec request");
         self.pending_rows.clear();
         self.pending_cmd = Some(cmd.name.clone());
         self.exec = Some((code, reply));
@@ -1400,15 +1401,24 @@ impl Actor {
             // Match the completion to the pending request via the echoed
             // return_code (falling back to the single pending request).
             let echo = cmd.get("return_code").and_then(|v| v.parse::<u32>().ok());
+            let id: i32 = cmd.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
             let matches = match (&self.exec, echo) {
                 (Some((code, _)), Some(e)) => e == *code,
                 (Some(_), None) => true,
                 (None, _) => false,
             };
+            tracing::debug!(
+                echo = ?echo,
+                id,
+                pending = ?self.exec.as_ref().map(|(code, _)| *code),
+                pending_cmd = ?self.pending_cmd,
+                pending_rows = self.pending_rows.len(),
+                matches,
+                "error packet"
+            );
             if matches {
                 if let Some((_, reply)) = self.exec.take() {
                     self.pending_cmd = None;
-                    let id: i32 = cmd.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
                     if id == 0 {
                         let rows = std::mem::take(&mut self.pending_rows);
                         let _ = reply.send(Ok(rows));
@@ -1449,10 +1459,30 @@ impl Actor {
                         || (req == "clientdbinfo"
                             && !cmd.name.starts_with("notify")
                             && cmd.get("client_database_id").is_some())
+                        // clientlist -away: an away-message-less client makes
+                        // `client_away_message` the line-leading bare key, so
+                        // the wire parser mistakes it for the command name.
+                        // The rest of the row always carries the clid.
+                        || (req == "clientlist"
+                            && !cmd.name.starts_with("notify")
+                            && cmd.get("clid").is_some())
                 })
                 .unwrap_or(false)
         {
+            tracing::debug!(
+                name = %cmd.name,
+                rows = cmd.params.len(),
+                pending_cmd = ?self.pending_cmd,
+                "collected as response rows"
+            );
             self.pending_rows.extend(cmd.params.clone());
+        } else if self.exec.is_some() && !cmd.name.starts_with("notify") {
+            tracing::debug!(
+                name = %cmd.name,
+                rows = cmd.params.len(),
+                pending_cmd = ?self.pending_cmd,
+                "command not collected as response rows"
+            );
         }
         {
             let mut replay = shared.replay.lock().unwrap();
