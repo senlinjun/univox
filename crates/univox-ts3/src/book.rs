@@ -239,6 +239,11 @@ pub fn apply_to_book(
                 let get = |k: &str| row.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
                 let id = member_id(get("clid").unwrap_or("0"));
                 let new_channel = channel_id(get("ctid").unwrap_or("0"));
+                // The row carries the mover (`invokerid`) — a clientmove we
+                // issued ourselves echoes our own clid there, an admin move
+                // carries theirs. Consumers classify self-moves vs forced
+                // moves from this, so it must not be dropped.
+                let invoker = get("invokerid").map(member_id);
                 book.with_mut(|b| {
                     if let Some(m) = b.members.get_mut(&id) {
                         m.channel_id = Some(new_channel.clone());
@@ -250,7 +255,7 @@ pub fn apply_to_book(
                 events.push(Event::ClientMoved {
                     member: id,
                     channel: new_channel,
-                    invoker: None,
+                    invoker,
                 });
             }
             events
@@ -383,13 +388,13 @@ pub fn apply_to_book(
 fn apply_initserver(book: &univox_core::Book, self_clid: u64, cmd: &Command) -> Vec<Event> {
     let get = |k: &str| cmd.get(k);
     // Everything not lifted into a typed field is preserved in `extra`
-    // (privilege key prompt, host message mode, password flag, ...).
-    const PARSED: [&str; 8] = [
+    // (privilege key prompt, password flag, ...). The host-message trio
+    // (hostmessage / welcomemessage / hostmessage_mode) stays in `extra` too:
+    // `Server.host_message` merges the two texts with a fallback, but TS3
+    // clients need them as separate properties.
+    const PARSED: [&str; 5] = [
         "virtualserver_id",
         "virtualserver_name",
-        "virtualserver_welcomemessage",
-        "virtualserver_hostmessage",
-        "virtualserver_hostmessage_mode",
         "virtualserver_clientsonline",
         "virtualserver_maxclients",
         "virtualserver_version",
