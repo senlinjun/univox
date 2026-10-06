@@ -110,6 +110,10 @@ TS6 适配参考。
 1. `ftinitupload`/`ftinitdownload`（带 `proto=1`）→ error 包之后收到
    `notifystartupload/download`（含 ftkey、port、size）。失败则为
    `notifystatusfiletransfer`（status=2051 文件不存在 / 2054 路径非法等）。
+   `ip` 字段不可靠：实测 ts3server 3.13.8 在 `filetransfer_ip=0.0.0.0`
+   （默认配置）时根本不带 `ip` 字段，也有服务器报告 `0.0.0.0`/空值——
+   官方客户端此时改用语音连接的对端 IP 连该端口；客户端实现必须同样
+   处理，否则会连到 127.0.0.1 直接 ECONNREFUSED（移动端必现）。
 2. TCP 连到该端口，发送 ASCII ftkey（无 ack），随后：
    - 上传：写完全部字节 → shutdown 写端 → 等服务器关闭（落盘完成）；
    - 下载：读到 EOF（size 只是参考）。

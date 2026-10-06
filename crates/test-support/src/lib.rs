@@ -153,7 +153,10 @@ impl Ts3Server {
             format!("default_voice_port={voice_port}"),
             "voice_ip=127.0.0.1".to_string(),
             format!("filetransfer_port={filetransfer_port}"),
-            "filetransfer_ip=127.0.0.1".to_string(),
+            // The ts3server production default: the notifystart* rows then
+            // carry no usable ip field, exercising the client's voice-peer
+            // fallback.
+            "filetransfer_ip=0.0.0.0".to_string(),
             format!("query_port={query_port}"),
             "query_ip=127.0.0.1".to_string(),
             format!("query_ssh_port={query_ssh_port}"),

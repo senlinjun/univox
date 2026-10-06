@@ -751,7 +751,7 @@ impl Ts3Ext for Ts3Session {
         let serverftfid: u32 =
             row.get("serverftfid").and_then(|v| v.parse().ok()).unwrap_or(0);
         let size: u64 = row.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let ft = transfer_channel_from(&row).await?;
+        let ft = transfer_channel_from(&row, self.conn().addr).await?;
         Ok(crate::filetransfer::FileDownload::new(
             ft,
             std::sync::Arc::downgrade(&self.conn()),
@@ -984,7 +984,7 @@ impl Ts3Session {
         let row = self.ft_init_upload(channel, name, size, overwrite, &cpw).await?;
         let serverftfid: u32 =
             row.get("serverftfid").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let ft = transfer_channel_from(&row).await?;
+        let ft = transfer_channel_from(&row, self.conn().addr).await?;
         Ok(crate::filetransfer::FileUpload::new(
             ft,
             std::sync::Arc::downgrade(&self.conn()),
@@ -1107,11 +1107,31 @@ fn check_ft_status(row: &Row, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// The IP to open the payload channel against. Servers that bind the file
+/// transfer port to every interface (the default `filetransfer_ip=0.0.0.0`)
+/// report `ip=0.0.0.0` or no usable ip at all — like the official client,
+/// fall back to the voice connection's peer address then.
+fn transfer_ip(reported: Option<&str>, voice_peer: std::net::SocketAddr) -> String {
+    match reported.and_then(|ip| ip.parse::<std::net::IpAddr>().ok()) {
+        Some(ip) if !ip.is_unspecified() => ip.to_string(),
+        _ => voice_peer.ip().to_string(),
+    }
+}
+
 /// Open the payload TCP channel from a transfer-start row.
-async fn transfer_channel_from(row: &Row) -> Result<crate::filetransfer::TransferChannel> {
+async fn transfer_channel_from(
+    row: &Row,
+    voice_peer: std::net::SocketAddr,
+) -> Result<crate::filetransfer::TransferChannel> {
     let port: u16 = row.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let ip = row.get("ip").unwrap_or("127.0.0.1");
-    crate::filetransfer::TransferChannel::connect(ip, port, row.get("ftkey").unwrap_or("")).await
+    let ip = transfer_ip(row.get("ip"), voice_peer);
+    tracing::debug!(
+        reported = ?row.get("ip"),
+        ip = %ip,
+        port,
+        "file transfer channel endpoint"
+    );
+    crate::filetransfer::TransferChannel::connect(&ip, port, row.get("ftkey").unwrap_or("")).await
 }
 
 /// Lowercase hex MD5 — the `client_flag_avatar` value the server expects
@@ -1124,4 +1144,37 @@ fn md5_hex(data: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transfer_ip;
+
+    fn peer() -> std::net::SocketAddr {
+        "127.0.0.1:9987".parse().unwrap()
+    }
+
+    #[test]
+    fn transfer_ip_uses_reported_address() {
+        assert_eq!(transfer_ip(Some("203.0.113.7"), peer()), "203.0.113.7");
+        assert_eq!(transfer_ip(Some("2001:db8::1"), peer()), "2001:db8::1");
+    }
+
+    #[test]
+    fn transfer_ip_falls_back_to_voice_peer_on_unspecified() {
+        // Servers with `filetransfer_ip=0.0.0.0` (the ts3server default)
+        // report these shapes; connecting to them directly fails on mobile
+        // with ECONNREFUSED (loopback).
+        assert_eq!(transfer_ip(Some("0.0.0.0"), peer()), "127.0.0.1");
+        assert_eq!(transfer_ip(Some("::"), peer()), "127.0.0.1");
+        assert_eq!(transfer_ip(Some(""), peer()), "127.0.0.1");
+        assert_eq!(transfer_ip(None, peer()), "127.0.0.1");
+    }
+
+    #[test]
+    fn transfer_ip_falls_back_on_ipv6_voice_peer() {
+        let peer: std::net::SocketAddr = "[2001:db8::5]:9987".parse().unwrap();
+        assert_eq!(transfer_ip(Some("0.0.0.0"), peer), "2001:db8::5");
+        assert_eq!(transfer_ip(None, peer), "2001:db8::5");
+    }
 }
