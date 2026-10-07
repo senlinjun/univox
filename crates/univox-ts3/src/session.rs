@@ -174,6 +174,9 @@ pub struct Ts3Session {
     pub(crate) last_self_update: std::sync::Mutex<Option<crate::ext::SelfUpdate>>,
     /// Locally stored whisper lists (FEATURES.md §6.4, client-side only).
     pub(crate) whisper_lists: std::sync::Mutex<crate::ext::WhisperListState>,
+    /// Channel password hashes for local verification (§11): filled by
+    /// successful join/create with a password, keyed by channel id.
+    pub(crate) pw_cache: std::sync::Mutex<std::collections::HashMap<u64, String>>,
     /// Kept for reconnects.
     connect_options: ConnectOptions,
     identity: Identity,
@@ -221,6 +224,7 @@ impl Ts3Session {
             own_uid: std::sync::Mutex::new(None),
             last_self_update: std::sync::Mutex::new(None),
             whisper_lists: std::sync::Mutex::new(crate::ext::WhisperListState::default()),
+            pw_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             connect_options: opts,
             identity,
             shutdown: shutdown_tx,
@@ -736,7 +740,15 @@ impl Session for Ts3Session {
         if let Some(pw) = password {
             cmd = cmd.param("cpw", hash_password(pw));
         }
-        self.exec_ok(cmd).await
+        self.exec_ok(cmd).await?;
+        // Remember the verified hash for local password verification (§11).
+        if let Some(pw) = password {
+            self.pw_cache
+                .lock()
+                .unwrap()
+                .insert(channel.as_u64().unwrap_or(0), hash_password(pw));
+        }
+        Ok(())
     }
 
     async fn leave_voice(&self) -> Result<()> {
@@ -833,6 +845,8 @@ impl Session for Ts3Session {
         if options.default_channel {
             cmd = cmd.param("channel_flag_default", 1);
         }
+        // NOTE: intentionally plaintext — the server hashes it itself
+        // (joining with cpw = hash_password(plaintext) then matches).
         if let Some(pw) = &options.password {
             cmd = cmd.param("channel_password", pw);
         }
@@ -866,6 +880,14 @@ impl Session for Ts3Session {
             }
         }
         let cid = cid.ok_or_else(|| Error::Other("channelcreate: no cid".into()))?;
+        // Remember the created channel's password hash for local
+        // verification (§11 verify_channel_password).
+        if let Some(pw) = &options.password {
+            self.pw_cache
+                .lock()
+                .unwrap()
+                .insert(cid, univox_ts3_proto::hash_password(pw));
+        }
         Ok(ChannelId::from_u64(cid))
     }
 

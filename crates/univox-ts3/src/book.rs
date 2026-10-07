@@ -319,6 +319,19 @@ pub fn apply_to_book(
             let mut events = Vec::new();
             for row in cmd.rows() {
                 let member = parse_member(row);
+                // Talk power request (§9.5): the server relays
+                // `client_talk_request` 0→1 transitions of any visible
+                // client as a plain clientupdated — surface them.
+                let now_requesting = row.get("client_talk_request") == Some("1");
+                let message = row.get("client_talk_request_msg").unwrap_or("").to_string();
+                let was_requesting = book
+                    .with(|b| {
+                        b.members
+                            .get(&member.id)
+                            .and_then(|m| m.extra.get("client_talk_request").cloned())
+                            == Some("1".to_owned())
+                    })
+                    .unwrap_or(false);
                 book.with_mut(|b| {
                     if let Some(m) = b.members.get_mut(&member.id) {
                         // Update rows only carry the changed fields — keep
@@ -331,6 +344,12 @@ pub fn apply_to_book(
                     let state = parse_member_state(row);
                     b.member_states.insert(member.id.clone(), state);
                 });
+                if now_requesting && !was_requesting {
+                    events.push(Event::TalkPowerRequested {
+                        member: member.id.clone(),
+                        message,
+                    });
+                }
                 events.push(Event::MemberUpdated { member });
             }
             events
@@ -557,6 +576,39 @@ mod tests {
         assert_eq!(ch.name, "Default Channel");
         assert!(ch.is_default);
         assert!(ch.has_kind(ChannelKind::Voice) && ch.has_kind(ChannelKind::Text));
+    }
+
+    #[test]
+    fn talk_power_request_event_fires_on_zero_to_one_transition() {
+        let b = book();
+        let enter = Command::parse("notifycliententerview cfid=0 ctid=1 clid=5 client_nickname=Tester client_type=0").unwrap();
+        apply_to_book(&b, 1, &enter, StreamOrigin::Client);
+
+        let request = Command::parse("notifyclientupdated clid=5 client_talk_request=1 client_talk_request_msg=plz").unwrap();
+        let events = apply_to_book(&b, 1, &request, StreamOrigin::Client);
+        let fired: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::TalkPowerRequested { member, message } => {
+                    Some((member.as_u64(), message.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fired, vec![(Some(5), "plz".to_owned())], "first 0->1 fires");
+
+        // A repeated update with the request still set does not fire again.
+        let events = apply_to_book(&b, 1, &request, StreamOrigin::Client);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::TalkPowerRequested { .. })),
+            "repeat must not fire"
+        );
+
+        // Withdraw (back to 0) then request again fires once more.
+        let cancel = Command::parse("notifyclientupdated clid=5 client_talk_request=0").unwrap();
+        apply_to_book(&b, 1, &cancel, StreamOrigin::Client);
+        let events = apply_to_book(&b, 1, &request, StreamOrigin::Client);
+        assert!(events.iter().any(|e| matches!(e, Event::TalkPowerRequested { .. })));
     }
 
     #[test]

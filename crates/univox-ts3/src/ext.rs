@@ -40,7 +40,7 @@ pub struct ClientDbEntry {
 pub struct ServerGroup {
     pub id: RoleId,
     pub name: String,
-    /// `sgtype`: 1 = template, 2 = regular, 3 = ServerQuery.
+    /// `type`: 0 = template, 1 = regular, 2 = ServerQuery.
     pub kind: u8,
 }
 
@@ -122,6 +122,81 @@ pub struct WhisperListState {
     pub(crate) lists: Vec<WhisperList>,
     pub(crate) active: Option<u64>,
     pub(crate) next_id: u64,
+}
+
+/// An active temporary password (`servertemppasswordlist`, §8.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TempPassword {
+    /// The temp password itself (`pw_clear`; may be empty when the
+    /// caller lacks `b_virtualserver_servertemppassword_list` detail).
+    pub password: String,
+    pub description: String,
+    /// Unix timestamps: when the password was created / expires.
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+    /// The channel the password unlocks.
+    pub channel: univox_core::id::ChannelId,
+}
+
+/// A channel-group assignment (`channelgroupclientlist`, §9.3): `member_db`
+/// has channel group `group` inside `channel`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelGroupAssignment {
+    pub member_db: DbId,
+    pub group: u64,
+    pub channel: univox_core::id::ChannelId,
+}
+
+/// Per-member connection quality (`clientconnectioninfo`, §11).
+/// `downstream` is server→client, `upstream` client→server; losses are
+/// fractions (0.0–1.0).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemberConnectionInfo {
+    pub ping: Option<f32>,
+    pub ping_deviation: Option<f32>,
+    pub idle_time: Option<Duration>,
+    pub downstream_packetloss_speech: Option<f32>,
+    pub downstream_packetloss_total: Option<f32>,
+    pub upstream_packetloss_speech: Option<f32>,
+    pub upstream_packetloss_total: Option<f32>,
+    pub downstream_bandwidth_last_second: Option<u64>,
+    pub upstream_bandwidth_last_second: Option<u64>,
+}
+
+/// Overall connection quality (`serverconnectioninfo`, §11).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServerConnectionInfo {
+    pub packets_sent_total: Option<u64>,
+    pub packets_received_total: Option<u64>,
+    pub bytes_sent_total: Option<u64>,
+    pub bytes_received_total: Option<u64>,
+    pub ping: Option<f32>,
+    pub ping_deviation: Option<f32>,
+    /// How long this connection has been up.
+    pub connected_time: Option<Duration>,
+    pub downstream_packetloss_total: Option<f32>,
+    pub upstream_packetloss_total: Option<f32>,
+}
+
+/// Group list kind column: real servers (3.13.8) send it as `type`
+/// (0 = template, 1 = regular, 2 = ServerQuery); the documented
+/// `sgtype`/`cgtype` names never appear on the wire.
+fn group_kind(row: &Row) -> u8 {
+    row.get("type")
+        .or_else(|| row.get("sgtype"))
+        .or_else(|| row.get("cgtype"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Parse an optional f32 row value.
+fn row_f32(row: &Row, key: &str) -> Option<f32> {
+    row.get(key).and_then(|v| v.parse().ok())
+}
+
+/// Parse an optional u64 row value.
+fn row_u64(row: &Row, key: &str) -> Option<u64> {
+    row.get(key).and_then(|v| v.parse().ok())
 }
 
 /// TS3-specific session extensions, implemented by [`Ts3Session`].
@@ -347,6 +422,128 @@ pub trait Ts3Ext: Session {
     async fn own_permissions(&self) -> Result<Vec<(String, i64)>>;
     /// `channelsubscribeall` — subscribe to every channel on the server.
     async fn subscribe_all(&self) -> Result<()>;
+
+    // ---- temporary passwords (§8.2) ----
+
+    /// Add a temporary password (§8.2 `servertemppasswordadd`): grants
+    /// access to `channel` (overriding its regular password) for `duration`
+    /// seconds (None/0 = until server stop). `channel_password` is the
+    /// target channel's own password, plaintext — hashed internally like
+    /// every channel password; only needed when the channel has one.
+    async fn add_temp_password(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        password: &str,
+        description: &str,
+        duration: Option<Duration>,
+        channel_password: Option<&str>,
+    ) -> Result<()>;
+    /// `servertemppasswordlist` — the active temporary passwords.
+    async fn temp_passwords(&self) -> Result<Vec<TempPassword>>;
+    /// `servertemppassworddel` — remove by the temp password itself.
+    async fn remove_temp_password(&self, password: &str) -> Result<()>;
+
+    // ---- channel group assignment (§9.3) ----
+
+    /// `setclientchannelgroup` — assign `group` (a channel group id from
+    /// [`Ts3Ext::channel_groups`]) to `member` inside `channel`. The
+    /// member's database id is resolved internally.
+    async fn set_member_channel_group(
+        &self,
+        member: &MemberId,
+        channel: &univox_core::id::ChannelId,
+        group: u64,
+    ) -> Result<()>;
+    /// `channelgroupclientlist` — the channel-group assignments of
+    /// `channel`, or of the whole server when `channel` is None.
+    async fn channel_group_members(
+        &self,
+        channel: Option<&univox_core::id::ChannelId>,
+    ) -> Result<Vec<ChannelGroupAssignment>>;
+
+    // ---- local password verification (§11) ----
+
+    /// Verify a channel password against the session's local hash cache
+    /// (same model as the original client, which verifies saved passwords
+    /// locally). The cache is filled by every successful
+    /// [`Session::join_voice`](univox_core::session::Session::join_voice) /
+    /// [`Session::create_channel`](univox_core::session::Session::create_channel)
+    /// with a password — the server's own stored hash is salted with the
+    /// channel identity and therefore not client-computable.
+    /// Channels without a password flag always verify `true`.
+    async fn verify_channel_password(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        plaintext: &str,
+    ) -> Result<bool>;
+
+    // ---- talk power (§9.5) ----
+
+    /// Request talk power in the current channel. The server relays the
+    /// request to privileged listeners as
+    /// [`Event::TalkPowerRequested`](univox_core::event::Event::TalkPowerRequested).
+    ///
+    /// Wire note (3.13.8): the documented `clientupdate
+    /// client_talk_request=1` is rejected (1538) for non-zero values and
+    /// `client_talk_request_msg` is not accepted at all — this method sends
+    /// the accepted `client_talk_request_time` spelling instead, so
+    /// `message` is currently not transmitted when the server only speaks
+    /// the new spelling.
+    async fn request_talk_power(&self, message: Option<&str>) -> Result<()>;
+    /// Withdraw the talk power request.
+    async fn cancel_talk_power_request(&self) -> Result<()>;
+    /// Grant `member` the talk power of `group` (a server group with
+    /// `b_client_is_talker`) for `duration` — the group membership is
+    /// removed automatically afterwards (locally scheduled; survives only
+    /// as long as this session).
+    async fn grant_talk_power(
+        &self,
+        member: &MemberId,
+        group: u64,
+        duration: Option<Duration>,
+    ) -> Result<()>;
+
+    // ---- connection / local info queries (§11) ----
+
+    /// `clientinfo`'s idle time — how long `member` has not sent anything.
+    async fn member_idle_time(&self, member: &MemberId) -> Result<Duration>;
+    /// `clientconnectioninfo` — per-member connection quality.
+    async fn member_connection_info(&self, member: &MemberId)
+        -> Result<MemberConnectionInfo>;
+    /// `serverconnectioninfo` — this client's overall connection quality.
+    async fn server_connection_info(&self) -> Result<ServerConnectionInfo>;
+
+    // ---- icons & banner (§8.1/§11) ----
+
+    /// Upload an icon (§11): stores `data` in the server-wide file area as
+    /// `/icon_<crc64>` (the TS3 convention — the id is the CRC64-ECMA of
+    /// the content) and returns that id. Apply it with
+    /// [`Ts3Ext::set_member_icon`] / [`Ts3Ext::set_channel_icon`].
+    async fn upload_icon(&self, data: &[u8]) -> Result<i64>;
+    /// Download the icon with `id` (from `/icon_<id>` in the server-wide
+    /// file area). Ids come from `client_icon_id` / `channel_icon_id` /
+    /// `virtualserver_icon_id` fields.
+    async fn download_icon(&self, id: i64) -> Result<Vec<u8>>;
+    /// Upload `data` and set it as this client's icon in one step.
+    async fn set_member_icon(&self, data: &[u8]) -> Result<i64>;
+    /// Set (or clear with 0) a channel's icon.
+    async fn set_channel_icon(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        icon_id: i64,
+    ) -> Result<()>;
+    /// Set the server banner (`serveredit hostbanner_*`). `gfx_url` is the
+    /// banner image URL (empty string clears the image); `gfx_interval`
+    /// is the rotation interval in seconds; `mode`: 0 = stretch (ignore
+    /// aspect), 1 = keep aspect, 2 = only show when the client is on a
+    /// banner-capable platform.
+    async fn set_host_banner(
+        &self,
+        url: &str,
+        gfx_url: Option<&str>,
+        gfx_interval: Option<u64>,
+        mode: Option<u8>,
+    ) -> Result<()>;
 }
 
 /// The file-transfer path of a client's avatar: `/avatar_<hash>`, where
@@ -1052,7 +1249,7 @@ impl Ts3Ext for Ts3Session {
             .map(|r| ServerGroup {
                 id: RoleId::from_u64(r.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0)),
                 name: r.get("name").unwrap_or_default().to_string(),
-                kind: r.get("sgtype").and_then(|v| v.parse().ok()).unwrap_or(0),
+                kind: group_kind(&r),
             })
             .collect())
     }
@@ -1070,7 +1267,9 @@ impl Ts3Ext for Ts3Session {
             .map(|r| ChannelGroup {
                 id: r.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0),
                 name: r.get("name").unwrap_or_default().to_string(),
-                kind: r.get("cgtype").and_then(|v| v.parse().ok()).unwrap_or(0),
+                // Real servers send the column as `type` (3.13.8); the
+                // documented `cgtype` never appears.
+                kind: group_kind(&r),
             })
             .collect())
     }
@@ -1113,6 +1312,375 @@ impl Ts3Ext for Ts3Session {
     async fn subscribe_all(&self) -> Result<()> {
         self.exec_ok(Command::new("channelsubscribeall")).await
     }
+
+    async fn add_temp_password(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        password: &str,
+        description: &str,
+        duration: Option<Duration>,
+        channel_password: Option<&str>,
+    ) -> Result<()> {
+        // pw is the temp password itself (returned as pw_clear in the
+        // list); tcpw is the target channel's password — hashed like every
+        // channel password we send.
+        let mut cmd = Command::new("servertemppasswordadd")
+            .param("pw", password)
+            .param("desc", description)
+            .param("tcid", channel.as_u64().unwrap_or(0));
+        if let Some(d) = duration {
+            cmd = cmd.param("duration", d.as_secs());
+        }
+        if let Some(cp) = channel_password {
+            cmd = cmd.param("tcpw", univox_ts3_proto::hash_password(cp));
+        }
+        self.exec_ok(cmd).await
+    }
+
+    async fn temp_passwords(&self) -> Result<Vec<TempPassword>> {
+        // 1281 "database empty result set": no temp passwords active.
+        let rows = match self
+            .exec_list(
+                Command::new("servertemppasswordlist"),
+                "notifyservertemppasswordlist",
+                "notifyservertemppasswordlistfinished",
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(Error::Platform { code: 1281, .. }) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        // The server answers inline AND repeats the rows as a
+        // notification — dedupe by content.
+        let mut out: Vec<TempPassword> = Vec::new();
+        for r in rows {
+            let pw = TempPassword {
+                password: r.get("pw_clear").unwrap_or_default().to_string(),
+                description: r.get("desc").unwrap_or_default().to_string(),
+                start: r.get("start").and_then(|v| v.parse().ok()),
+                end: r.get("end").and_then(|v| v.parse().ok()),
+                channel: univox_core::id::ChannelId::from_u64(
+                    r.get("tcid").and_then(|v| v.parse().ok()).unwrap_or(0),
+                ),
+            };
+            if !out.contains(&pw) {
+                out.push(pw);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn remove_temp_password(&self, password: &str) -> Result<()> {
+        self.exec_ok(Command::new("servertemppassworddel").param("pw", password))
+            .await
+    }
+
+    async fn set_member_channel_group(
+        &self,
+        member: &MemberId,
+        channel: &univox_core::id::ChannelId,
+        group: u64,
+    ) -> Result<()> {
+        let uid = self.uid_from_clid(member).await?;
+        let db = self
+            .dbid_from_uid(&uid)
+            .await?
+            .ok_or_else(|| Error::Other(format!("no database id for uid {uid}")))?;
+        self.exec_ok(
+            Command::new("setclientchannelgroup")
+                .param("cgid", group)
+                .param("cid", channel.as_u64().unwrap_or(0))
+                .param("cldbid", db.as_u64().unwrap_or(0)),
+        )
+        .await
+    }
+
+    async fn channel_group_members(
+        &self,
+        channel: Option<&univox_core::id::ChannelId>,
+    ) -> Result<Vec<ChannelGroupAssignment>> {
+        let mut cmd = Command::new("channelgroupclientlist");
+        if let Some(c) = channel {
+            cmd = cmd.param("cid", c.as_u64().unwrap_or(0));
+        }
+        // 1281 "database empty result set": no assignments — empty list.
+        let rows = match self.exec(cmd).await {
+            Ok(rows) => rows,
+            Err(Error::Platform { code: 1281, .. }) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| ChannelGroupAssignment {
+                member_db: DbId::from_u64(r.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(0)),
+                group: r.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0),
+                channel: univox_core::id::ChannelId::from_u64(
+                    r.get("cid").and_then(|v| v.parse().ok()).unwrap_or(0),
+                ),
+            })
+            .collect())
+    }
+
+    async fn verify_channel_password(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        plaintext: &str,
+    ) -> Result<bool> {
+        // No password flag in the book ⇒ trivially verified.
+        let flag = self.book().with(|b| {
+            b.channels
+                .get(channel)
+                .and_then(|c| c.extra.get("channel_flag_password").cloned())
+        });
+        if flag.flatten().as_deref() == Some("0") {
+            return Ok(true);
+        }
+        let cached = self
+            .pw_cache
+            .lock()
+            .unwrap()
+            .get(&channel.as_u64().unwrap_or(0))
+            .cloned();
+        let cached = cached
+            .ok_or_else(|| Error::Other(
+                "no cached password hash for this channel; join or create it once first".into(),
+            ))?;
+        Ok(cached == univox_ts3_proto::hash_password(plaintext))
+    }
+
+    async fn request_talk_power(&self, message: Option<&str>) -> Result<()> {
+        // The documented key (`clientupdate client_talk_request=1`) is
+        // rejected by server 3.13.8 with 1538 for any non-zero value, and
+        // both `client_talk_request_msg` and `clientconnectioninfo`-style
+        // spellings are unknown; the accepted spelling is
+        // `client_talk_request_time=<unix ts>` (the relayed
+        // `client_talk_request` is a timestamp per the reference book).
+        // `message` is kept in the API for servers that still accept the
+        // documented message field but is not transmitted on 3.13.8.
+        let _ = message;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cmd = Command::new("clientupdate").param("client_talk_request_time", now.max(1));
+        self.exec_ok(cmd).await
+    }
+
+    async fn cancel_talk_power_request(&self) -> Result<()> {
+        self.exec_ok(Command::new("clientupdate").param("client_talk_request", 0u8))
+            .await
+    }
+
+    async fn grant_talk_power(
+        &self,
+        member: &MemberId,
+        group: u64,
+        duration: Option<Duration>,
+    ) -> Result<()> {
+        let uid = self.uid_from_clid(member).await?;
+        let db = self
+            .dbid_from_uid(&uid)
+            .await?
+            .ok_or_else(|| Error::Other(format!("no database id for uid {uid}")))?;
+        self.exec_ok(
+            Command::new("servergroupaddclient")
+                .param("sgid", group)
+                .param("cldbid", db.as_u64().unwrap_or(0)),
+        )
+        .await?;
+        if let Some(d) = duration {
+            // Revoke through the connection directly — the task outlives
+            // this call and only needs the connection handle.
+            let conn = self.conn();
+            let dbid = db.as_u64().unwrap_or(0);
+            tokio::spawn(async move {
+                tokio::time::sleep(d).await;
+                if let Err(e) = conn
+                    .exec(
+                        Command::new("servergroupdelclient")
+                            .param("sgid", group)
+                            .param("cldbid", dbid),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "talk power auto-revoke failed");
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn member_idle_time(&self, member: &MemberId) -> Result<Duration> {
+        // `clientinfo` returns no inline rows on the client protocol;
+        // `clientlist -times` carries client_idle_time for everyone.
+        let want = member.as_u64().unwrap_or(0).to_string();
+        let rows = self.exec(Command::new("clientlist").opt("times")).await?;
+        rows.iter()
+            .find(|r| r.get("clid") == Some(want.as_str()))
+            .and_then(|r| row_u64(r, "client_idle_time"))
+            .map(Duration::from_millis)
+            .ok_or_else(|| Error::Other("clientlist -times: member not found".into()))
+    }
+
+    async fn member_connection_info(
+        &self,
+        member: &MemberId,
+    ) -> Result<MemberConnectionInfo> {
+        // Clients push their own stats with `setconnectioninfo` when the
+        // server asks; `getconnectioninfo` fetches a member's last pushed
+        // row. (`clientconnectioninfo` is ServerQuery-only.)
+        let rows = self
+            .exec(Command::new("getconnectioninfo").param("clid", member.as_u64().unwrap_or(0)))
+            .await?;
+        let r = rows.first().ok_or_else(|| Error::Other("getconnectioninfo: no row".into()))?;
+        Ok(MemberConnectionInfo {
+            ping: row_f32(r, "connection_ping"),
+            ping_deviation: row_f32(r, "connection_ping_deviation"),
+            idle_time: row_u64(r, "connection_idle_time").map(Duration::from_millis),
+            downstream_packetloss_speech: row_f32(r, "connection_server2client_packetloss_speech"),
+            downstream_packetloss_total: row_f32(r, "connection_server2client_packetloss_total"),
+            upstream_packetloss_speech: row_f32(r, "connection_client2server_packetloss_speech"),
+            upstream_packetloss_total: row_f32(r, "connection_client2server_packetloss_total"),
+            downstream_bandwidth_last_second: row_u64(
+                r,
+                "connection_bandwidth_received_last_second_total",
+            ),
+            upstream_bandwidth_last_second: row_u64(r, "connection_bandwidth_sent_last_second_total"),
+        })
+    }
+
+    async fn server_connection_info(&self) -> Result<ServerConnectionInfo> {
+        // There is no server-aggregate command on the client protocol;
+        // report this client's own pushed stats (its connection quality).
+        let me = MemberId::from_u64(u64::from(self.clid()));
+        let rows = self
+            .exec(Command::new("getconnectioninfo").param("clid", me.as_u64().unwrap_or(0)))
+            .await?;
+        let r = rows.first().ok_or_else(|| Error::Other("getconnectioninfo: no row".into()))?;
+        Ok(ServerConnectionInfo {
+            packets_sent_total: row_u64(r, "connection_packets_sent_total"),
+            packets_received_total: row_u64(r, "connection_packets_received_total"),
+            bytes_sent_total: row_u64(r, "connection_bytes_sent_total"),
+            bytes_received_total: row_u64(r, "connection_bytes_received_total"),
+            ping: row_f32(r, "connection_ping"),
+            ping_deviation: row_f32(r, "connection_ping_deviation"),
+            connected_time: row_u64(r, "connection_connected_time").map(Duration::from_millis),
+            downstream_packetloss_total: row_f32(r, "connection_server2client_packetloss_total"),
+            upstream_packetloss_total: row_f32(r, "connection_client2server_packetloss_total"),
+        })
+    }
+
+    async fn upload_icon(&self, data: &[u8]) -> Result<i64> {
+        let id = icon_id(data);
+        let name = format!("/icon_{id}");
+        // Server-wide icons live in the channel-0 file area; no overwrite
+        // flag needed — the name is content-addressed.
+        let mut up = self
+            .upload_file_stream(
+                &univox_core::id::ChannelId::from_u64(0),
+                &name,
+                data.len() as u64,
+                None,
+            )
+            .await?;
+        up.write_chunk(data).await?;
+        up.finish().await?;
+        Ok(id)
+    }
+
+    async fn download_icon(&self, id: i64) -> Result<Vec<u8>> {
+        self.download_file(&univox_core::id::ChannelId::from_u64(0), &format!("/icon_{id}"))
+            .await
+    }
+
+    async fn set_member_icon(&self, data: &[u8]) -> Result<i64> {
+        let id = self.upload_icon(data).await?;
+        // Client icons live on the database id as `i_icon_id` (same
+        // permission storage as channel icons).
+        let db = self.own_dbid().await?;
+        self.exec_ok(
+            Command::new("clientaddperm")
+                .param("cldbid", db.as_u64().unwrap_or(0))
+                .param("permsid", "i_icon_id")
+                .param("permvalue", id)
+                .param("permskip", 0u8)
+                .param("permnegated", 0u8),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    async fn set_channel_icon(
+        &self,
+        channel: &univox_core::id::ChannelId,
+        icon_id: i64,
+    ) -> Result<()> {
+        // Icons are stored as the `i_icon_id` permission — `channeledit
+        // channel_icon_id=…` is rejected with 1538 on 3.13.8.
+        let cid = channel.as_u64().unwrap_or(0);
+        if icon_id == 0 {
+            self.exec_ok(Command::new("channeldelperm").param("cid", cid).param("permsid", "i_icon_id"))
+                .await
+        } else {
+            self.exec_ok(
+                Command::new("channeladdperm")
+                    .param("cid", cid)
+                    .param("permsid", "i_icon_id")
+                    // permvalue parses as i32; servers echo the unsigned view.
+                    .param("permvalue", icon_id as i32)
+                    .param("permskip", 0u8)
+                    .param("permnegated", 0u8),
+            )
+            .await
+        }
+    }
+
+    async fn set_host_banner(
+        &self,
+        url: &str,
+        gfx_url: Option<&str>,
+        gfx_interval: Option<u64>,
+        mode: Option<u8>,
+    ) -> Result<()> {
+        let mut cmd = Command::new("serveredit").param("virtualserver_hostbanner_url", url);
+        if let Some(g) = gfx_url {
+            cmd = cmd.param("virtualserver_hostbanner_gfx_url", g);
+        }
+        if let Some(i) = gfx_interval {
+            cmd = cmd.param("virtualserver_hostbanner_gfx_interval", i);
+        }
+        if let Some(m) = mode {
+            cmd = cmd.param("virtualserver_hostbanner_mode", m);
+        }
+        self.exec_ok(cmd).await
+    }
+}
+
+/// The icon id for icon `data`: the low 32 bits of the CRC64-ECMA of the
+/// content (unsigned view) — the TS3 convention for `/icon_<id>` names.
+/// Truncation is required because icons ride on the permission value
+/// (`i_icon_id`), which is a 32-bit integer; servers echo the unsigned
+/// form in `channel_icon_id`/`client_icon_id`.
+pub fn icon_id(data: &[u8]) -> i64 {
+    crc64_ecma(data) as u32 as i64
+}
+
+/// CRC64-ECMA (poly 0x42F0E1EBA9EA3693, init 0, no reflection).
+fn crc64_ecma(data: &[u8]) -> u64 {
+    const POLY: u64 = 0x42F0_E1EB_A9EA_3693;
+    let mut crc: u64 = 0;
+    for &b in data {
+        crc ^= u64::from(b) << 56;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000_0000_0000 != 0 {
+                (crc << 1) ^ POLY
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
 }
 
 impl Ts3Session {
@@ -1330,6 +1898,14 @@ mod tests {
         let peer: std::net::SocketAddr = "[2001:db8::5]:9987".parse().unwrap();
         assert_eq!(transfer_ip(Some("0.0.0.0"), peer), "2001:db8::5");
         assert_eq!(transfer_ip(None, peer), "2001:db8::5");
+    }
+
+    #[test]
+    fn crc64_ecma_check_vector() {
+        // CRC-64/ECMA-681 catalogue check value for "123456789".
+        assert_eq!(super::crc64_ecma(b"123456789"), 0x6c40df5f0b497347);
+        // icon_id is the unsigned 32-bit truncation of the same value.
+        assert_eq!(super::icon_id(b"123456789"), 0x0b497347u32 as i64);
     }
 
     #[test]

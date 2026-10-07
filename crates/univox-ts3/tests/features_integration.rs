@@ -746,3 +746,276 @@ async fn passworded_channel_transfer_and_join() {
     );
     session.disconnect(None).await.ok();
 }
+
+// ---- temporary passwords (§8.2) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn temp_password_roundtrip() {
+    let server = spawn_server().await;
+    let session = spawn_admin("Temp Pw", &server).await;
+    let channel = ChannelId::from_u64(1);
+
+    assert!(session.temp_passwords().await.expect("list").is_empty());
+    session
+        .add_temp_password(&channel, "temp-pass-1", "univox test", Some(Duration::from_secs(60)), None)
+        .await
+        .expect("add");
+    let list = session.temp_passwords().await.expect("list");
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(list[0].password, "temp-pass-1");
+    assert_eq!(list[0].description, "univox test");
+    assert_eq!(list[0].channel, channel);
+
+    session.remove_temp_password("temp-pass-1").await.expect("del");
+    assert!(session.temp_passwords().await.expect("list").is_empty());
+
+    session.disconnect(None).await.ok();
+}
+
+// ---- channel group assignment (§9.3) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_group_assignment_roundtrip() {
+    let server = spawn_server().await;
+    let admin = spawn_admin("Cg Admin", &server).await;
+    let member = connect_as(&server, "Cg Member").await;
+
+    // A regular channel group (skip templates and query groups).
+    let groups = admin.channel_groups().await.expect("channel_groups");
+    let group = groups.iter().find(|g| g.kind == 1).expect("regular channel group");
+
+    let member_id = member
+        .book()
+        .with(|b| b.self_member.member_id.clone())
+        .flatten()
+        .expect("member clid");
+    admin
+        .set_member_channel_group(&member_id, &ChannelId::from_u64(1), group.id)
+        .await
+        .expect("setclientchannelgroup");
+
+    let assignments = admin
+        .channel_group_members(Some(&ChannelId::from_u64(1)))
+        .await
+        .expect("channelgroupclientlist");
+    let mine = assignments
+        .iter()
+        .find(|a| a.group == group.id)
+        .expect("assignment recorded");
+    assert_eq!(mine.channel, ChannelId::from_u64(1));
+
+    member.disconnect(None).await.ok();
+    admin.disconnect(None).await.ok();
+}
+
+// ---- local password verification (§11) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_channel_password_positive_and_negative() {
+    let server = spawn_server().await;
+    let session = spawn_admin("Verify Bot", &server).await;
+
+    // The default channel has no password: everything "verifies".
+    let default_channel = ChannelId::from_u64(1);
+    assert!(session
+        .verify_channel_password(&default_channel, "")
+        .await
+        .expect("verify"));
+
+    let channel = session
+        .create_channel(univox_core::model::ChannelOptions {
+            name: "Verify Vault".into(),
+            parent: Some(ChannelId::from_u64(1)),
+            permanence: univox_core::model::Permanence::SemiPermanent,
+            password: Some("sekret".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("create passworded channel");
+
+    assert!(session.verify_channel_password(&channel, "sekret").await.expect("verify"));
+    assert!(!session.verify_channel_password(&channel, "wrong").await.expect("verify"));
+
+    session.disconnect(None).await.ok();
+}
+
+// ---- talk power (§9.5) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn talk_power_request_is_accepted_and_cancellable() {
+    let server = spawn_server().await;
+    let requester = spawn_admin("TP Requester", &server).await;
+
+    // 3.13.8 accepts the client_talk_request_time spelling (see
+    // request_talk_power docs); whether/how it relays the request is
+    // server-dependent, so only the API round-trip is asserted here.
+    requester.request_talk_power(Some("may I speak?")).await.expect("request");
+    requester.cancel_talk_power_request().await.expect("cancel");
+
+    requester.disconnect(None).await.ok();
+}
+
+
+/// Does `dbid` currently carry server group `sgid`?
+async fn member_has_group(
+    admin: &Arc<Ts3Session>,
+    dbid: &univox_core::id::DbId,
+    sgid: u64,
+) -> bool {
+    let rows = admin
+        .exec(
+            Command::new("servergroupsbyclientid")
+                .param("cldbid", dbid.as_u64().unwrap_or(0)),
+        )
+        .await
+        .expect("servergroupsbyclientid");
+    rows.iter()
+        .any(|r| r.get("sgid").and_then(|v| v.parse::<u64>().ok()) == Some(sgid))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn talk_power_grant_is_auto_revoked() {
+    let server = spawn_server().await;
+    let admin = spawn_admin("TP Admin", &server).await;
+    let member = connect_as(&server, "TP Member").await;
+
+    // A regular server group the admin may assign (admin token = Server Admin).
+    let groups = admin.server_groups().await.expect("server_groups");
+    let group = groups.iter().find(|g| g.kind == 1).expect("regular server group");
+
+    let member_id = member
+        .book()
+        .with(|b| b.self_member.member_id.clone())
+        .flatten()
+        .expect("member clid");
+    let uid = admin.uid_from_clid(&member_id).await.expect("uid");
+    let dbid = admin.dbid_from_uid(&uid).await.expect("dbid").expect("dbid");
+
+    admin
+        .grant_talk_power(&member_id, group.id.as_u64().unwrap_or(0), Some(Duration::from_millis(800)))
+        .await
+        .expect("grant");
+
+    assert!(
+        member_has_group(&admin, &dbid, group.id.as_u64().unwrap_or(0)).await,
+        "group assigned"
+    );
+
+    // The auto-revoke fires after the duration.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert!(
+        !member_has_group(&admin, &dbid, group.id.as_u64().unwrap_or(0)).await,
+        "group revoked after duration"
+    );
+
+    member.disconnect(None).await.ok();
+    admin.disconnect(None).await.ok();
+}
+
+// ---- connection / local info queries (§11) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_info_queries() {
+    let server = spawn_server().await;
+    // `clientlist -times` needs elevated permissions.
+    let session = spawn_admin("Info Bot", &server).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let me = session
+        .book()
+        .with(|b| b.self_member.member_id.clone())
+        .flatten()
+        .expect("self clid");
+
+    let idle = session.member_idle_time(&me).await.expect("idle time");
+    assert!(idle.as_millis() >= 0);
+
+    let info = session.member_connection_info(&me).await.expect("member info");
+    assert!(info.idle_time.is_some(), "idle present: {info:?}");
+
+    let server_info = session.server_connection_info().await.expect("server info");
+    assert!(
+        server_info.upstream_packetloss_total.is_some(),
+        "server-side loss measurement present: {server_info:?}"
+    );
+
+    session.disconnect(None).await.ok();
+}
+
+// ---- icons & banner (§8.1/§11) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn icon_upload_download_and_assignment() {
+    let server = spawn_server().await;
+    let session = spawn_admin("Icon Bot", &server).await;
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 7) as u8).collect();
+
+    let id = session.upload_icon(&payload).await.expect("upload_icon");
+    let got = session.download_icon(id).await.expect("download_icon");
+    assert_eq!(got, payload, "icon roundtrip");
+
+    // Same content ⇒ same id (content-addressed).
+    let id2 = session.upload_icon(&payload).await.expect("re-upload");
+    assert_eq!(id, id2);
+
+    session.set_channel_icon(&ChannelId::from_u64(1), id).await.expect("set_channel_icon");
+    let icons = session
+        .exec(Command::new("channellist").opt("icon"))
+        .await
+        .expect("channellist");
+    let cid_row = icons
+        .iter()
+        .find(|r| r.get("cid") == Some("1"))
+        .expect("channel 1 row");
+    assert_eq!(cid_row.get("channel_icon_id"), Some(id.to_string().as_str()));
+
+    let member_icon = session.set_member_icon(&payload).await.expect("set_member_icon");
+    assert_eq!(member_icon, id);
+    // Client icons are stored as the i_icon_id permission on our dbid.
+    let perms = session.own_permissions().await.expect("own_permissions");
+    assert!(
+        perms
+            .iter()
+            .any(|(name, value)| name == "i_icon_id" && *value as u32 as i64 == id),
+        "i_icon_id permission missing: {perms:?}"
+    );
+
+    session.disconnect(None).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_banner_edit() {
+    let server = spawn_server().await;
+    let session = spawn_admin("Banner Bot", &server).await;
+
+    session
+        .set_host_banner("https://univox.test", Some("https://univox.test/banner.png"), Some(60), Some(1))
+        .await
+        .expect("set_host_banner");
+
+    // Read back through a fresh connection's initserver dump.
+    let reader = connect_as(&server, "Banner Reader").await;
+    let extra_has = |key: &str, want: &str| {
+        let key = key.to_owned();
+        let want = want.to_owned();
+        let reader = reader.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            reader
+                .book()
+                .with(|b| {
+                    b.server
+                        .as_ref()
+                        .and_then(|s| s.extra.get(&key).cloned())
+                })
+                .flatten()
+                == Some(want)
+        }
+    };
+    assert!(extra_has("virtualserver_hostbanner_url", "https://univox.test").await);
+    assert!(extra_has("virtualserver_hostbanner_gfx_url", "https://univox.test/banner.png").await);
+    assert!(extra_has("virtualserver_hostbanner_mode", "1").await);
+
+    session.disconnect(None).await.ok();
+    reader.disconnect(None).await.ok();
+}
