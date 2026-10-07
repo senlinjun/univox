@@ -26,8 +26,10 @@ TS6 适配参考。
    `client_input_hardware=1` 与 `client_output_hardware=1` ——
    服务器只在这类客户端之间转发语音（未声明的客户端收不到任何语音包，
    也不会被标记为说话）。
-6. **initserver**（S→C）：`aclid` 为本端 clid；**它会作为对 clientinit
-   的确认**（独立的 Ack id=1 可以忽略）。
+6. **initserver**（S→C）：`aclid` 为本端 clid；它在语义上作为对
+   clientinit 的应答。服务器**还会**为 clientinit 发独立的 Ack
+   （ack 流 PId=1，payload=2）——不加密（见 §1.3），按 payload 幂等
+   处理即可，无需特判丢弃。
 
 ### 1.2 包头
 
@@ -45,8 +47,14 @@ TS6 适配参考。
   再 `key[0..2] ^= PId`。每个 (type, gen) 缓存一份。
 - EAX 的 AAD = **包头去 MAC 后的 3~5 字节（PId|CId|Type）**，不含 MAC。
 - 伪造加密（FakeKey `c:\windows\syste` / FakeNonce `m\firewall32.cpl`）：
-  initivexpand2（server pid 0）、clientek（client pid 1）、client 的首个
-  Ack（pid 0）。
+  initivexpand2（server pid 0）、clientek（client pid 1）、双方各自的
+  首个 Ack（pid 0）。
+- **服务器的 Ack 从第 2 个起不加密**（实测 3.13.8）：UNENCRYPTED 标志
+  置位，MAC = SharedMac，payload 明文 = 被 ack 的 PId（BE16）。客户端
+  必须先看 UNENCRYPTED 标志再尝试解密，否则所有 Ack 解密失败——ack
+  丢失不会被服务器补发（对重复包静默丢弃、不 re-ack），滞留的命令重发
+  12 次（约 2.5 分钟）后连接被判死。解密失败时抓到的原始包
+  （`MAC(8)|PId(2)|Type(1)=0x86|payload(2)`）是定位此问题的关键证据。
 - Ping/Pong 恒不加密，MAC 必须填 `SharedMac` —— 初版漏掉导致服务器
   静默丢包、30 秒后判死。
 
@@ -128,6 +136,25 @@ TS6 适配参考。
 - S2C：`[inner_id(2)][from(2)][codec(1)][opus]`；whisper 的 S2C 形状相同。
 - 收发双方都必须在 clientinit 声明过硬件（§1.1 第 5 步）。
 - 语音包同样走 EAX（voice_encryption=true 时），不重传、无确认。
+
+### 6.1 Whisper（耳语，2026-10 实测 3.13.8）
+
+- **C2S 两种格式**（PId 同 voice 计数器，外层 Type=1 VoiceWhisper）：
+  - 旧格式（Newprotocol 不置位）：`[codec][N 频道数][M 客户端数]
+    [cid:8 ×N][clid:16 ×M][opus]`，成员/频道可混合（≤65 目标）。
+    实测 `send_whisper`（成员定向）经服务器转发可被目标收到。
+  - newprotocol 格式（Newprotocol 置位）：`[codec][whisper_type][target]
+    [target_id:8][opus]`；whisper_type=1、target=0、target_id=cid 定向
+    整个频道（`send_whisper_to_channel` 即此格式，已验证）。
+- **S2C relay 一律为 VoiceWhisper 类型**，形状与普通 S2C 语音完全相同
+  （`[inner_id][from][codec][opus]`）——**区分靠外层包类型，不靠任何
+  标志位**。此前按 NEWPROTOCOL 标志判断导致所有耳语被当作普通语音
+  解析（音频正常但丢失 whisper 标记）。
+- 权限门控（`i_client_whisper_power` / 目标
+  `i_client_needed_whisper_power`）不足时服务器**静默丢弃**：语音包无
+  ack，发送方无从得知对方是否听到。
+- whisper 列表是纯客户端本地概念（原版客户端存于配置），与服务器无
+  任何命令交互。
 
 ## 7. 稳定性要点
 

@@ -172,6 +172,8 @@ pub struct Ts3Session {
     /// Last applied runtime self state, replayed after reconnects
     /// (FEATURES.md §2.4: mutes/away/commander survive a resume).
     pub(crate) last_self_update: std::sync::Mutex<Option<crate::ext::SelfUpdate>>,
+    /// Locally stored whisper lists (FEATURES.md §6.4, client-side only).
+    pub(crate) whisper_lists: std::sync::Mutex<crate::ext::WhisperListState>,
     /// Kept for reconnects.
     connect_options: ConnectOptions,
     identity: Identity,
@@ -218,6 +220,7 @@ impl Ts3Session {
             ftfid: std::sync::atomic::AtomicU32::new(1),
             own_uid: std::sync::Mutex::new(None),
             last_self_update: std::sync::Mutex::new(None),
+            whisper_lists: std::sync::Mutex::new(crate::ext::WhisperListState::default()),
             connect_options: opts,
             identity,
             shutdown: shutdown_tx,
@@ -479,6 +482,12 @@ async fn run_recv_pipeline(
     let mut voice_rx = conn.voice_sink_handle().subscribe();
     let mixer = std::sync::Arc::new(std::sync::Mutex::new(univox_voice::Mixer::new(5)));
     let mixer_decode = mixer.clone();
+    // Per-member flag of whether their latest frame arrived as a whisper
+    // packet (S2CWhisper) — read by the pacer for the speaking events.
+    let whisper_flags: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u16, bool>>,
+    > = std::sync::Arc::default();
+    let whisper_decode = whisper_flags.clone();
 
     // Decode task.
     let mut stop2 = stop.clone();
@@ -489,15 +498,18 @@ async fn run_recv_pipeline(
                 _ = stop2.changed() => break,
             };
             let Ok(packet) = packet else { break };
-            // Whispered audio arrives as S2CWhisper but carries the same
-            // shape — mix it like normal voice.
-            let (id, from, c, data) = match packet {
-                univox_ts3_proto::VoiceData::S2C { id, from, codec, data }
-                | univox_ts3_proto::VoiceData::S2CWhisper { id, from, codec, data } => {
-                    (id, from, codec, data)
+            // Whispered audio carries the same shape as normal voice —
+            // mix it too, but remember it came as a whisper (§6.4).
+            let (id, from, c, data, whisper) = match packet {
+                univox_ts3_proto::VoiceData::S2C { id, from, codec, data } => {
+                    (id, from, codec, data, false)
+                }
+                univox_ts3_proto::VoiceData::S2CWhisper { id, from, codec, data } => {
+                    (id, from, codec, data, true)
                 }
                 _ => continue,
             };
+            whisper_decode.lock().unwrap().insert(from, whisper);
             if c != univox_voice::CODEC_OPUS_VOICE {
                 continue;
             }
@@ -526,12 +538,20 @@ async fn run_recv_pipeline(
             let (mixed, contributors) = mixer.lock().unwrap().mix_frame(univox_voice::FRAME_SAMPLES);
             for m in &contributors {
                 if !speaking.contains(m) {
-                    core.bus.send(Event::SpeakingStarted { member: m.clone() });
+                    let whispering = m
+                        .as_u64()
+                        .and_then(|c| whisper_flags.lock().unwrap().get(&(c as u16)).copied())
+                        .unwrap_or(false);
+                    core.bus.send(Event::SpeakingStarted { member: m.clone(), whispering });
                 }
             }
             for m in &speaking {
                 if !contributors.contains(m) {
-                    core.bus.send(Event::SpeakingStopped { member: m.clone() });
+                    let whispering = m
+                        .as_u64()
+                        .and_then(|c| whisper_flags.lock().unwrap().get(&(c as u16)).copied())
+                        .unwrap_or(false);
+                    core.bus.send(Event::SpeakingStopped { member: m.clone(), whispering });
                 }
             }
             speaking = contributors;

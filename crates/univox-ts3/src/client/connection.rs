@@ -108,6 +108,9 @@ pub(crate) struct RawStats {
     /// When we last sent our own ping (for RTT on the matching pong).
     pub last_ping_sent: Option<Instant>,
     pub ping: Option<Duration>,
+    /// Command packets awaiting their ack (0 on a healthy link; stuck
+    /// non-zero means acks are not being processed).
+    pub pending_commands: usize,
 }
 
 /// Why the connection ended (set by the actor before it exits).
@@ -272,6 +275,7 @@ impl UdpConnection {
             },
             bandwidth_up: s.bytes_up,
             bandwidth_down: s.bytes_down,
+            pending_commands: s.pending_commands,
             reconnect_count: 0,
         }
     }
@@ -770,20 +774,27 @@ impl Actor {
             };
             match header.packet_type() {
                 Ok(PacketType::Ack) | Ok(PacketType::AckLow) => {
-                    if header.packet_id() == 1 {
-                        // Ignorable: `initserver` acks clientinit instead.
-                        continue;
-                    }
-                    let content =
-                        self.decrypt_or_fake(&data, header.packet_type()?, header.packet_id());
+                    // Payload-driven and idempotent — see the ack branch in
+                    // `handle_udp`. The server's clientinit ack arrives here
+                    // unencrypted; removing the (already initserver-cleared)
+                    // pending entry is a no-op, so it needs no special case.
+                    let for_type = if header.packet_type()? == PacketType::Ack {
+                        PacketType::Command
+                    } else {
+                        PacketType::CommandLow
+                    };
+                    let unencrypted = header
+                        .flags()
+                        .map(|f| f.contains(Flags::UNENCRYPTED))
+                        .unwrap_or(false);
+                    let content = if unencrypted {
+                        Some(header.content().to_vec())
+                    } else {
+                        self.decrypt_or_fake(&data, header.packet_type()?, header.packet_id())
+                    };
                     if let Some(c) = content {
                         if c.len() >= 2 {
                             let acked = u16::from_be_bytes([c[0], c[1]]);
-                            let for_type = if header.packet_type()? == PacketType::Ack {
-                                PacketType::Command
-                            } else {
-                                PacketType::CommandLow
-                            };
                             let was_clientek = for_type == PacketType::Command && acked == 1;
                             self.remove_pending(for_type, acked);
                             if was_clientek && !clientinit_sent {
@@ -986,6 +997,7 @@ impl Actor {
 
     fn send_command(&mut self, cmd: Command, force_fake: bool) {
         let content = cmd.serialize().into_bytes();
+        tracing::debug!(name = %cmd.name, "sending command");
         let p_type = PacketType::Command;
         let base_id = self.codec.outgoing_p_ids[p_type as usize];
         let c_id = self.params.as_ref().map(|p| p.c_id).unwrap_or(0);
@@ -1017,6 +1029,9 @@ impl Actor {
             last_sent: Instant::now(),
             resends: 0,
         });
+        if let Ok(mut s) = self.stats.lock() {
+            s.pending_commands = self.pending.len();
+        }
         self.flush_pending();
     }
 
@@ -1101,6 +1116,12 @@ impl Actor {
             let delay = Duration::from_millis(350u64 << p.resends.min(6));
             if elapsed >= delay {
                 p.resends += 1;
+                tracing::debug!(
+                    p_type = ?p.p_type,
+                    p_id = p.p_id,
+                    resends = p.resends,
+                    "resending packet"
+                );
                 to_send.extend(p.datagrams.iter().cloned());
                 p.last_sent = now;
                 if let Ok(mut s) = self.stats.lock() {
@@ -1113,6 +1134,9 @@ impl Actor {
             }
         }
         self.pending.retain(|p| p.resends < 12);
+        if let Ok(mut s) = self.stats.lock() {
+            s.pending_commands = self.pending.len();
+        }
         for d in to_send {
             self.send_udp(d);
         }
@@ -1163,6 +1187,7 @@ impl Actor {
             return;
         };
         let p_id = header.packet_id();
+        tracing::trace!(p_type = ?p_type, p_id, "s2c packet");
         if p_type == PacketType::Pong {
             if let Ok(mut s) = self.stats.lock() {
                 if let Some(sent) = s.last_ping_sent {
@@ -1203,20 +1228,44 @@ impl Actor {
                 }
             }
             PacketType::Ack | PacketType::AckLow => {
-                if p_type == PacketType::Ack && p_id == 1 {
-                    // Ignorable: `initserver` acks clientinit instead.
-                    return;
-                }
-                if let Some(c) = self.decrypt_or_fake(&data, p_type, p_id) {
-                    if c.len() >= 2 {
+                // The server sends its acks UNENCRYPTED from the second one
+                // on (flag 0x80, MAC = SharedMac, payload = acked packet id
+                // big-endian) — like Ping/Pong. Only the very first ack (the
+                // clientek ack, stream p_id 0) is fake-encrypted. Everything
+                // here is payload-driven: an ack for an already-removed
+                // pending entry is an idempotent no-op, so no stream-id
+                // special-casing is needed (an earlier rule dropped acks
+                // with stream p_id 1 believing them redundant clientinit
+                // acks — in fact it ate the ack of the first post-connect
+                // command and stranded it until the resend give-up).
+                let for_type = if p_type == PacketType::Ack {
+                    PacketType::Command
+                } else {
+                    PacketType::CommandLow
+                };
+                let unencrypted = header
+                    .flags()
+                    .map(|f| f.contains(Flags::UNENCRYPTED))
+                    .unwrap_or(false);
+                let content = if unencrypted {
+                    Some(header.content().to_vec())
+                } else {
+                    self.decrypt_or_fake(&data, p_type, p_id)
+                };
+                match content {
+                    Some(c) if c.len() >= 2 => {
                         let acked = u16::from_be_bytes([c[0], c[1]]);
-                        let for_type = if p_type == PacketType::Ack {
-                            PacketType::Command
-                        } else {
-                            PacketType::CommandLow
-                        };
+                        tracing::debug!(
+                            stream_p_id = p_id,
+                            acked,
+                            p_type = ?for_type,
+                            unencrypted,
+                            "incoming ack"
+                        );
                         self.remove_pending(for_type, acked);
                     }
+                    Some(_) => tracing::debug!(stream_p_id = p_id, "short ack payload"),
+                    None => tracing::warn!(stream_p_id = p_id, p_type = ?p_type, "ack decrypt failed"),
                 }
             }
             PacketType::Ping => {
@@ -1234,7 +1283,7 @@ impl Actor {
                     self.decrypt_packet(&data, p_type, p_id)
                 };
                 if let Some(c) = content {
-                    if let Ok(v) = proto::parse_voice(Direction::S2C, Flags::empty(), &c) {
+                    if let Ok(v) = proto::parse_voice(Direction::S2C, p_type, Flags::empty(), &c) {
                         let _ = shared.voice_tx.send(v.clone());
                         if let Some(sink) = &self.voice_sink {
                             let _ = sink.send(v);
@@ -1388,8 +1437,16 @@ impl Actor {
         // rewrite validated against captures). Exact-match removal here
         // stranded entries whose ack never echoed their id verbatim, and
         // every stranded entry killed the connection after 12 resends.
+        let before = self.pending.len();
         self.pending
             .retain(|p| !(p.p_type == p_type && p.p_id <= p_id));
+        let removed = before - self.pending.len();
+        if removed > 0 {
+            tracing::debug!(p_type = ?p_type, acked = p_id, removed, "acked pending packets");
+        }
+        if let Ok(mut s) = self.stats.lock() {
+            s.pending_commands = self.pending.len();
+        }
     }
 
     fn dispatch_command(&mut self, shared: &ActorShared, cmd: Command) {

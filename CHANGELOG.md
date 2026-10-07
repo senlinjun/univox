@@ -100,10 +100,30 @@
 - **`join_voice` 不再忽略 password**：`clientmove` 支持可选 `cpw`
   （base64(sha1)），真机验证正反例。
 
+### Whisper（FEATURES.md §6.4）
+
+- **`Ts3Ext::send_whisper(targets, frame)`**：按目标列表（成员/频道混合，
+  ≤65）发送耳语帧，旧协议目标列表格式（`[codec][N][M][cid:8×N][clid:16×M]
+  [opus]`），真机验证成员定向可收。注意权限门控（whisper power）不足时
+  服务器静默丢弃——`Ok(())` 只代表"已发送"。
+- **破坏性变更：`Event::SpeakingStarted/Stopped` 增加 `whispering` 字段**。
+  根因修复：S2C 耳语 relay 与普通语音形状相同，此前按 NEWPROTOCOL 标志
+  区分导致所有耳语被当作普通语音（标志判断本身有误，区分靠包类型
+  Voice/VoiceWhisper——见 `docs/TS3_PROTOCOL_NOTES.md` §6.1）。
+  `parse_voice` 签名相应增加包类型参数（proto 内部 API）。
+- **Whisper 列表管理（纯客户端本地）**：`whisper_lists / add_whisper_list /
+  remove_whisper_list / set_active_whisper_list / active_whisper_list /
+  send_whisper_to_active_list`；列表随会话保存在内存（重连保留，进程退出
+  不持久化）。
+- `send_whisper_to_channel` 保留原签名与 newprotocol 格式（频道定向，
+  已验证），作为 `send_whisper` 的补充。
+
 ### 测试
 
 - 单元：book 映射（poke/left-reason/extra fixture）、identity JSON 往返、
-  handshake 参数、传输句柄（本地 TCP mock）。
+  handshake 参数、传输句柄（本地 TCP mock）、whisper 包组装。
+- 集成补：成员定向 whisper 可收 + SpeakingStarted whispering 标记、
+  whisper 列表 CRUD/激活边界。
 - 集成（本地真实 ts3server，`tests/features_integration.rs`）：
   流式上传/下载往返、abort 删除半成品、move_channel 排序、
   server_groups/channel_groups/own_permissions/subscribe_all、

@@ -96,6 +96,34 @@ impl SelfUpdate {
     }
 }
 
+/// One whisper destination (FEATURES.md §6.4): either every client inside
+/// a channel or a single member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhisperTarget {
+    Member(MemberId),
+    Channel(univox_core::id::ChannelId),
+}
+
+/// The server's hard cap on the number of whisper destinations per packet.
+pub const WHISPER_MAX_TARGETS: usize = 65;
+
+/// A locally stored whisper list — named target set, activatable for
+/// one-shot sending (FEATURES.md §6.4). Purely client-side state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhisperList {
+    pub id: u64,
+    pub name: String,
+    pub targets: Vec<WhisperTarget>,
+}
+
+/// In-memory whisper-list storage of a session (crate-internal).
+#[derive(Default)]
+pub struct WhisperListState {
+    pub(crate) lists: Vec<WhisperList>,
+    pub(crate) active: Option<u64>,
+    pub(crate) next_id: u64,
+}
+
 /// TS3-specific session extensions, implemented by [`Ts3Session`].
 ///
 /// Every method maps 1:1 to a TS3 client-protocol command; most need
@@ -161,13 +189,40 @@ pub trait Ts3Ext: Session {
 
     async fn update_self(&self, update: SelfUpdate) -> Result<()>;
 
-    // ---- whisper (§6.5) ----
+    // ---- whisper (§6.4) ----
 
+    /// Whisper one Opus frame (20 ms) to a mixed list of members and
+    /// channels (at most 65 targets — the server's hard limit). The audio
+    /// travels as voice-whisper packets and does not reach anyone else,
+    /// including the clients inside our own channel.
+    ///
+    /// Note that the server silently drops the audio when the sender's
+    /// `i_client_whisper_power` or a target's `i_client_needed_whisper_power`
+    /// gate it — voice packets are not acknowledged, so `Ok(())` only means
+    /// "sent", not "heard".
+    async fn send_whisper(&self, targets: &[WhisperTarget], frame: &[u8]) -> Result<()>;
     /// Whisper one Opus frame (20 ms) to every client inside `channel`.
     /// Verified on server 3.13.8 with the new whisper protocol:
-    /// whisper_type=1, target=0, target_id=channel id. Client-targeted
-    /// whispering needs the whisper-list machinery (not yet implemented).
+    /// whisper_type=1, target=0, target_id=channel id.
     async fn send_whisper_to_channel(&self, channel: &univox_core::id::ChannelId, frame: &[u8]) -> Result<()>;
+
+    /// The locally stored whisper lists (§6.4: a purely client-side
+    /// concept — the original client keeps them in its config, the server
+    /// never sees them). The list survives reconnects but not process
+    /// restarts.
+    fn whisper_lists(&self) -> Vec<WhisperList>;
+    /// Add a whisper list; returns its id (also usable as the activation
+    /// handle for [`Ts3Ext::set_active_whisper_list`]).
+    async fn add_whisper_list(&self, name: &str, targets: Vec<WhisperTarget>) -> Result<u64>;
+    /// Remove a whisper list; deactivates it when it was active.
+    async fn remove_whisper_list(&self, id: u64) -> Result<()>;
+    /// Activate a whisper list (or none). The active list is what
+    /// [`Ts3Ext::send_whisper_to_active_list`] sends to.
+    async fn set_active_whisper_list(&self, id: Option<u64>) -> Result<()>;
+    /// The id of the currently active whisper list, if any.
+    async fn active_whisper_list(&self) -> Option<u64>;
+    /// Whisper one Opus frame to every target of the active whisper list.
+    async fn send_whisper_to_active_list(&self, frame: &[u8]) -> Result<()>;
 
     // ---- plugin command relay (§11) ----
 
@@ -385,6 +440,31 @@ fn message_from_row(row: &Row) -> Message {
     }
 }
 
+/// Build the voice content of a legacy-format whisper packet
+/// (Newprotocol unset, tsdeclarations §1.8.2.1): after the codec byte come
+/// the channel count, the client count, then the channel ids (u64 BE) and
+/// the client ids (u16 BE), then the opus frame. The connection prepends
+/// the voice sequence id.
+pub(crate) fn build_whisper_packet(targets: &[WhisperTarget], frame: &[u8]) -> Result<Vec<u8>> {
+    let (channels, members): (Vec<&WhisperTarget>, Vec<&WhisperTarget>) =
+        targets.iter().partition(|t| matches!(t, WhisperTarget::Channel(_)));
+    let mut content =
+        Vec::with_capacity(3 + channels.len() * 8 + members.len() * 2 + frame.len());
+    content.push(univox_ts3_proto::CODEC_OPUS_VOICE);
+    content.push(channels.len() as u8);
+    content.push(members.len() as u8);
+    for t in channels {
+        let WhisperTarget::Channel(c) = t else { unreachable!("partitioned") };
+        content.extend_from_slice(&c.as_u64().unwrap_or(0).to_be_bytes());
+    }
+    for t in members {
+        let WhisperTarget::Member(m) = t else { unreachable!("partitioned") };
+        content.extend_from_slice(&(m.as_u64().unwrap_or(0) as u16).to_be_bytes());
+    }
+    content.extend_from_slice(frame);
+    Ok(content)
+}
+
 #[async_trait]
 impl Ts3Ext for Ts3Session {
     async fn uid_from_clid(&self, member: &MemberId) -> Result<String> {
@@ -594,14 +674,29 @@ impl Ts3Ext for Ts3Session {
         self.exec_ok(update.into_command()).await
     }
 
+    async fn send_whisper(&self, targets: &[WhisperTarget], frame: &[u8]) -> Result<()> {
+        if targets.is_empty() {
+            return Err(Error::InvalidArgument("send_whisper: no targets".into()));
+        }
+        if targets.len() > WHISPER_MAX_TARGETS {
+            return Err(Error::InvalidArgument(format!(
+                "send_whisper: {} targets exceed the server limit of {WHISPER_MAX_TARGETS}",
+                targets.len()
+            )));
+        }
+        let content = build_whisper_packet(targets, frame)?;
+        self.conn().send_voice(content, univox_ts3_proto::PacketType::VoiceWhisper).await;
+        Ok(())
+    }
+
     async fn send_whisper_to_channel(
         &self,
         channel: &univox_core::id::ChannelId,
         frame: &[u8],
     ) -> Result<()> {
-        // New whisper format: [codec][whisper_type][target][target_id:8]
-        // [opus data]; whisper_type 1 targets a channel. The connection
-        // prepends the voice sequence id.
+        // Verified on server 3.13.8 with the new whisper protocol:
+        // [codec][whisper_type=1][target=0][cid:8][opus]; whisper_type 1
+        // targets a channel.
         let mut content = Vec::with_capacity(11 + frame.len());
         content.push(univox_ts3_proto::CODEC_OPUS_VOICE);
         content.push(1); // whisper_type: channel
@@ -610,6 +705,64 @@ impl Ts3Ext for Ts3Session {
         content.extend_from_slice(frame);
         self.conn().send_voice(content, univox_ts3_proto::PacketType::VoiceWhisper).await;
         Ok(())
+    }
+
+    fn whisper_lists(&self) -> Vec<WhisperList> {
+        let st = self.whisper_lists.lock().unwrap();
+        st.lists.clone()
+    }
+
+    async fn add_whisper_list(&self, name: &str, targets: Vec<WhisperTarget>) -> Result<u64> {
+        if targets.is_empty() {
+            return Err(Error::InvalidArgument("add_whisper_list: no targets".into()));
+        }
+        if targets.len() > WHISPER_MAX_TARGETS {
+            return Err(Error::InvalidArgument(format!(
+                "add_whisper_list: {} targets exceed the server limit of {WHISPER_MAX_TARGETS}",
+                targets.len()
+            )));
+        }
+        let mut st = self.whisper_lists.lock().unwrap();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.lists.push(WhisperList { id, name: name.to_owned(), targets });
+        Ok(id)
+    }
+
+    async fn remove_whisper_list(&self, id: u64) -> Result<()> {
+        let mut st = self.whisper_lists.lock().unwrap();
+        let before = st.lists.len();
+        st.lists.retain(|l| l.id != id);
+        if st.active == Some(id) {
+            st.active = None;
+        }
+        if st.lists.len() == before {
+            return Err(Error::Other(format!("no whisper list with id {id}")));
+        }
+        Ok(())
+    }
+
+    async fn set_active_whisper_list(&self, id: Option<u64>) -> Result<()> {
+        let mut st = self.whisper_lists.lock().unwrap();
+        if let Some(id) = id {
+            if !st.lists.iter().any(|l| l.id == id) {
+                return Err(Error::Other(format!("no whisper list with id {id}")));
+            }
+        }
+        st.active = id;
+        Ok(())
+    }
+
+    async fn active_whisper_list(&self) -> Option<u64> {
+        self.whisper_lists.lock().unwrap().active
+    }
+
+    async fn send_whisper_to_active_list(&self, frame: &[u8]) -> Result<()> {
+        let active = self.whisper_lists.lock().unwrap().active;
+        let list = active
+            .and_then(|id| self.whisper_lists.lock().unwrap().lists.iter().find(|l| l.id == id).cloned())
+            .ok_or_else(|| Error::Other("no active whisper list".into()))?;
+        self.send_whisper(&list.targets, frame).await
     }
 
     async fn send_plugin_command(
@@ -1148,7 +1301,8 @@ fn md5_hex(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::transfer_ip;
+    use super::{build_whisper_packet, transfer_ip, WhisperTarget};
+    use univox_core::id::MemberId;
 
     fn peer() -> std::net::SocketAddr {
         "127.0.0.1:9987".parse().unwrap()
@@ -1176,5 +1330,35 @@ mod tests {
         let peer: std::net::SocketAddr = "[2001:db8::5]:9987".parse().unwrap();
         assert_eq!(transfer_ip(Some("0.0.0.0"), peer), "2001:db8::5");
         assert_eq!(transfer_ip(None, peer), "2001:db8::5");
+    }
+
+    #[test]
+    fn whisper_packet_mixed_targets_layout() {
+        // Legacy format: [codec][N][M][cid:8 ×N][clid:16 ×M][opus].
+        let targets = vec![
+            WhisperTarget::Member(MemberId::from_u64(7)),
+            WhisperTarget::Channel(univox_core::id::ChannelId::from_u64(1)),
+            WhisperTarget::Channel(univox_core::id::ChannelId::from_u64(2)),
+        ];
+        let pkt = build_whisper_packet(&targets, &[0xAA, 0xBB]).unwrap();
+        assert_eq!(pkt[0], univox_ts3_proto::CODEC_OPUS_VOICE);
+        assert_eq!(pkt[1], 2, "channel count");
+        assert_eq!(pkt[2], 1, "client count");
+        assert_eq!(&pkt[3..11], &1u64.to_be_bytes());
+        assert_eq!(&pkt[11..19], &2u64.to_be_bytes());
+        assert_eq!(&pkt[19..21], &7u16.to_be_bytes());
+        assert_eq!(&pkt[21..], &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn whisper_packet_all_members() {
+        let targets: Vec<WhisperTarget> =
+            (1..=3).map(|i| WhisperTarget::Member(MemberId::from_u64(i))).collect();
+        let pkt = build_whisper_packet(&targets, &[0x01]).unwrap();
+        assert_eq!(&pkt[1..3], &[0, 3]);
+        assert_eq!(&pkt[3..5], &1u16.to_be_bytes());
+        assert_eq!(&pkt[5..7], &2u16.to_be_bytes());
+        assert_eq!(&pkt[7..9], &3u16.to_be_bytes());
+        assert_eq!(&pkt[9..], &[0x01]);
     }
 }

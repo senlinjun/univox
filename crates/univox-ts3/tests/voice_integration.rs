@@ -8,6 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use test_support::Ts3Server;
 use univox_core::audio::{AudioPacket, AudioSink};
+use univox_core::event::Event;
 use univox_core::session::Session;
 use univox_core::{ConnectOptions, Credential, InitialState};
 use univox_ts3::ext::Ts3Ext;
@@ -145,6 +146,78 @@ async fn whisper_reaches_target() {
     let packets = collected.lock().unwrap().clone();
     let audible = packets.iter().filter(|p| p.iter().any(|x| x.abs() > 0.05)).count();
     assert!(audible >= 20, "whisper not audible at target: {audible} frames");
+
+    whisperer.disconnect(None).await.ok();
+    listener.disconnect(None).await.ok();
+}
+
+/// A whispers to a member list (`send_whisper`, legacy multi-target
+/// format); B hears it and the speaking events flag it as a whisper
+/// (FEATURES.md §6.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn member_whisper_reaches_target_and_flags_whispering() {
+    use univox_core::id::MemberId;
+
+    let server = Ts3Server::start().await.expect("boot");
+    let whisperer = connect_voice_session(&server, "Member Whisperer").await;
+    let listener = connect_voice_session(&server, "Whisper Listener").await;
+
+    // The listener's own clid is the whisper destination.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let target = loop {
+        let t = listener
+            .book()
+            .with(|b| b.self_member.member_id.clone())
+            .flatten();
+        if let Some(t) = t {
+            break t;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "listener clid unknown");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let mut events = listener.events();
+    let collected = Arc::new(Mutex::new(Vec::new()));
+    listener
+        .start_receiving(Box::new(CollectSink { packets: collected.clone() }))
+        .await
+        .expect("start_receiving");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let codec = univox_voice::OpusEncoder::new().expect("encoder");
+    let mut source = SineSource::new(440.0);
+    for _ in 0..40 {
+        let frame = source.next_frame();
+        let packet = codec.encode(&frame).expect("encode");
+        whisperer
+            .send_whisper(
+                &[univox_ts3::WhisperTarget::Member(MemberId::from_u64(
+                    target.as_u64().unwrap_or(0),
+                ))],
+                &packet,
+            )
+            .await
+            .expect("send_whisper");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Audio arrived through the whisper path…
+    let packets = collected.lock().unwrap().clone();
+    let audible = packets.iter().filter(|p| p.iter().any(|x| x.abs() > 0.05)).count();
+    assert!(audible >= 20, "member whisper not audible: {audible} frames");
+
+    // …and the speaking events flagged it as a whisper.
+    let mut saw_whisper_start = false;
+    while let Ok(Some(ev)) =
+        tokio::time::timeout(Duration::from_millis(500), events.next()).await
+    {
+        if matches!(ev.as_ref(), Event::SpeakingStarted { whispering: true, .. }) {
+            saw_whisper_start = true;
+            break;
+        }
+    }
+    assert!(saw_whisper_start, "no whisper-flagged SpeakingStarted");
 
     whisperer.disconnect(None).await.ok();
     listener.disconnect(None).await.ok();

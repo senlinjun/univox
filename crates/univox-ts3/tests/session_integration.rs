@@ -6,8 +6,9 @@ use test_support::Ts3Server;
 use univox_core::event::Event;
 use univox_core::model::{MessageTarget, Permanence};
 use univox_core::session::{Session, SessionManager};
+use univox_core::id::MemberId;
 use univox_core::{ChannelOptions, ConnectOptions, Credential};
-use univox_ts3::{Ts3ConnectOptions, Ts3Driver, Ts3Session};
+use univox_ts3::{Ts3ConnectOptions, Ts3Driver, Ts3Ext, Ts3Session};
 use univox_ts3_proto::{Command, Identity, RowExt};
 
 async fn spawn_session(nickname: &str) -> (Ts3Server, std::sync::Arc<Ts3Session>) {
@@ -206,6 +207,36 @@ async fn session_manager_routes_ts3() {
     session.disconnect(Some("bye".to_string())).await.ok();
 }
 
+/// Regression: the server's ack packets arrive UNENCRYPTED (flag 0x80,
+/// MAC = SharedMac, payload = the acked packet id) from the second ack on.
+/// They were undecryptable before, so the ack of the first post-connect
+/// command was dropped, its pending entry stranded through 12 resends, and
+/// the resend give-up killed the connection ~2.5 minutes into every session.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_command_acks_are_processed() {
+    let server = Ts3Server::start().await.expect("boot");
+    let opts = ConnectOptions::new(format!("127.0.0.1:{}", server.voice_port))
+        .nickname("Ack Bot")
+        .credential(Credential::Anonymous);
+    let session = Ts3Session::connect(opts, Identity::create())
+        .await
+        .expect("connect");
+
+    // The clientlist from prime_book must be acked shortly after connect.
+    let mut pending = usize::MAX;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        pending = session.stats().pending_commands;
+        if pending == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(pending, 0, "command acks are not being processed");
+
+    session.disconnect(Some("done".to_string())).await.ok();
+}
+
 /// Regression: with `-away`, the clientlist response rows lead with a bare
 /// `client_away_message` key whenever no listed client is away (the server
 /// omits the `=` for empty values). The wire parser then mistakes the bare
@@ -262,6 +293,60 @@ async fn session_clientlist_away_dump_populates_roster() {
         rows.iter().any(|r| r.get("clid") == Some(clid.as_str())),
         "clientlist returned no rows for self"
     );
+
+    session.disconnect(Some("done".to_string())).await.ok();
+}
+
+/// Whisper lists are pure client-side state: CRUD, activation and the
+/// guard rails (FEATURES.md §6.4). No server interaction involved.
+#[tokio::test(flavor = "multi_thread")]
+async fn whisper_list_crud_and_activation() {
+    let (_server, session) = spawn_session("Whisper List Bot").await;
+
+    assert!(session.whisper_lists().is_empty());
+    assert_eq!(session.active_whisper_list().await, None);
+
+    let a = session
+        .add_whisper_list(
+            "admins",
+            vec![univox_ts3::WhisperTarget::Member(5u64.into())],
+        )
+        .await
+        .expect("add list a");
+    let b = session
+        .add_whisper_list(
+            "lobby",
+            vec![univox_ts3::WhisperTarget::Channel(1u64.into())],
+        )
+        .await
+        .expect("add list b");
+    assert_ne!(a, b);
+
+    let lists = session.whisper_lists();
+    assert_eq!(lists.len(), 2);
+    let admins = lists.iter().find(|l| l.id == a).expect("list a");
+    assert_eq!(admins.name, "admins");
+    assert_eq!(admins.targets.len(), 1);
+
+    session.set_active_whisper_list(Some(b)).await.expect("activate");
+    assert_eq!(session.active_whisper_list().await, Some(b));
+
+    // Removing the active list also deactivates it.
+    session.remove_whisper_list(b).await.expect("remove b");
+    assert_eq!(session.active_whisper_list().await, None);
+
+    // Unknown ids error on remove/activate; sending without an active
+    // list errors too.
+    assert!(session.remove_whisper_list(999).await.is_err());
+    assert!(session.set_active_whisper_list(Some(999)).await.is_err());
+    assert!(session.send_whisper_to_active_list(&[0u8; 4]).await.is_err());
+
+    // Empty or oversized target sets are rejected at add time.
+    assert!(session.add_whisper_list("empty", vec![]).await.is_err());
+    let too_many: Vec<univox_ts3::WhisperTarget> = (0..66)
+        .map(|i| univox_ts3::WhisperTarget::Member(MemberId::from_u64(i)))
+        .collect();
+    assert!(session.add_whisper_list("big", too_many).await.is_err());
 
     session.disconnect(Some("done".to_string())).await.ok();
 }

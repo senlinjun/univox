@@ -367,13 +367,30 @@ pub fn build_c2s_whisper(
     content
 }
 
-pub fn parse_voice(direction: Direction, flags: Flags, content: &[u8]) -> Result<VoiceData> {
+/// Parse a voice packet's content. The voice/whisper distinction follows
+/// the packet type (tsdeclarations §1.8.2): S2C relays of whispers arrive
+/// as `PacketType::VoiceWhisper` — the wire layout of S2C voice and
+/// S2C whisper is identical, so only the type tells them apart. For C2S
+/// whisper packets the NEWPROTOCOL flag selects the target-list format
+/// vs. the newprotocol group-target format.
+pub fn parse_voice(direction: Direction, p_type: PacketType, flags: Flags, content: &[u8]) -> Result<VoiceData> {
     if content.len() < 4 {
         return Err(Error::Protocol("voice packet too short".into()));
     }
     let id = u16::from_be_bytes([content[0], content[1]]);
-    match direction {
-        Direction::C2S => {
+    match (direction, p_type) {
+        (Direction::C2S, PacketType::Voice) => {
+            let codec = content[2];
+            let rest = &content[3..];
+            Ok(VoiceData::C2S { id, codec, data: rest.to_vec() })
+        }
+        (Direction::S2C, PacketType::Voice) => {
+            let from = u16::from_be_bytes([content[2], content[3]]);
+            let codec = content[4];
+            let data = content[5..].to_vec();
+            Ok(VoiceData::S2C { id, from, codec, data })
+        }
+        (Direction::C2S, PacketType::VoiceWhisper) => {
             let codec = content[2];
             let rest = &content[3..];
             if flags.contains(Flags::NEWPROTOCOL) {
@@ -389,25 +406,45 @@ pub fn parse_voice(direction: Direction, flags: Flags, content: &[u8]) -> Result
                     data: rest[10..].to_vec(),
                 })
             } else {
-                // Plain voice; the legacy target-list whisper format is only
-                // produced by [`build_c2s_whisper`].
-                Ok(VoiceData::C2S {
+                // Legacy target-list whisper format is only produced by
+                // [`build_c2s_whisper`]; plain voice is parsed above.
+                let codec = content[2];
+                if rest.len() < 2 {
+                    return Err(Error::Protocol("whisper packet too short".into()));
+                }
+                let channels_n = rest[0] as usize;
+                let clients_n = rest[1] as usize;
+                let mut off = 2;
+                let mut channels = Vec::with_capacity(channels_n);
+                for _ in 0..channels_n {
+                    channels.push(u64::from_be_bytes(
+                        rest[off..off + 8].try_into().unwrap(),
+                    ));
+                    off += 8;
+                }
+                let mut clients = Vec::with_capacity(clients_n);
+                for _ in 0..clients_n {
+                    clients.push(u16::from_be_bytes(
+                        rest[off..off + 2].try_into().unwrap(),
+                    ));
+                    off += 2;
+                }
+                Ok(VoiceData::C2SWhisper {
                     id,
                     codec,
-                    data: rest.to_vec(),
+                    channels,
+                    clients,
+                    data: rest[off..].to_vec(),
                 })
             }
         }
-        Direction::S2C => {
+        (Direction::S2C, PacketType::VoiceWhisper) => {
             let from = u16::from_be_bytes([content[2], content[3]]);
             let codec = content[4];
             let data = content[5..].to_vec();
-            if flags.contains(Flags::NEWPROTOCOL) {
-                Ok(VoiceData::S2CWhisper { id, from, codec, data })
-            } else {
-                Ok(VoiceData::S2C { id, from, codec, data })
-            }
+            Ok(VoiceData::S2CWhisper { id, from, codec, data })
         }
+        _ => Err(Error::Protocol("invalid voice packet direction/type".into())),
     }
 }
 
@@ -456,7 +493,7 @@ mod tests {
     #[test]
     fn voice_roundtrip() {
         let content = build_c2s_voice(5, CodecType::OpusVoice as u8, &[1, 2, 3]);
-        let v = parse_voice(Direction::C2S, Flags::empty(), &content).unwrap();
+        let v = parse_voice(Direction::C2S, PacketType::Voice, Flags::empty(), &content).unwrap();
         assert_eq!(
             v,
             VoiceData::C2S {
@@ -471,10 +508,24 @@ mod tests {
         s2c.extend_from_slice(&12u16.to_be_bytes());
         s2c.push(CodecType::OpusMusic as u8);
         s2c.extend_from_slice(&[9, 9]);
-        let v = parse_voice(Direction::S2C, Flags::empty(), &s2c).unwrap();
+        let v = parse_voice(Direction::S2C, PacketType::Voice, Flags::empty(), &s2c).unwrap();
         assert_eq!(
             v,
             VoiceData::S2C {
+                id: 9,
+                from: 12,
+                codec: 5,
+                data: vec![9, 9]
+            }
+        );
+
+        // Same bytes as a whisper relay (VoiceWhisper type) — the wire
+        // layout is identical; only the packet type tells them apart.
+        let v = parse_voice(Direction::S2C, PacketType::VoiceWhisper, Flags::empty(), &s2c)
+            .unwrap();
+        assert_eq!(
+            v,
+            VoiceData::S2CWhisper {
                 id: 9,
                 from: 12,
                 codec: 5,

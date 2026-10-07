@@ -17,6 +17,7 @@ pub use client::{HandshakeOptions, UdpConnection};
 pub use query::{QueryConnection, QueryOptions, QuerySession};
 pub use ext::{
     avatar_path, ChannelGroup, ClientDbEntry, ClientMatch, SelfUpdate, ServerGroup, Ts3Ext,
+    WhisperList, WhisperTarget, WHISPER_MAX_TARGETS,
 };
 pub use session::{
     map_proto_err, self_clid, ts3_capabilities, Ts3ConnectOptions, Ts3Driver, Ts3Session,

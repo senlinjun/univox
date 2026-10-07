@@ -223,10 +223,10 @@ Created → Connecting → Authenticating → Handshaking → Connected
 - 平台差异：KOOK 公开 API **不支持收流**（能力 ✗）；OOPZ 经 RTC 桥可收；Discord 支持收流（每用户独立 ssrc，逐成员队列 + 抖动缓冲/混音器直接复用 univox-voice；语音必须实现 DAVE，见 §6.8）。
 - 说话检测：`SpeakingStarted / SpeakingStopped` 事件（TS3 基于音频流、OOPZ 基于 RTC 指示器、Discord 基于语音网关 `SPEAKING` 事件）。
 
-### 6.4 ★ Whisper（定向耳语）— TS3
+### 6.4 Whisper（定向耳语）— TS3 ✓
 
-- 发送 whisper 至**目标列表**（成员/频道混合，≤65 目标；受 `i_client_whisper_power` / 目标 `i_client_needed_whisper_power` 门控）。
-- 接收 whisper 单独标记（`S2CWhisper`），可区分普通语音。
+- 发送 whisper 至**目标列表**（成员/频道混合，≤65 目标；受 `i_client_whisper_power` / 目标 `i_client_needed_whisper_power` 门控——权限不足时服务器静默丢弃，`Ok` 只代表已发送）。
+- 接收 whisper 单独标记（`S2CWhisper`），可区分普通语音（`SpeakingStarted/Stopped.whispering`）。
 - **Whisper 列表管理**：客户端本地目标列表的增删查与激活（原版客户端功能，tsclientlib 未实现）。
 
 ### 6.5 ★ 3D 定位音频 — TS3

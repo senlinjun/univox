@@ -63,8 +63,10 @@ pub enum Event {
     SelfVoiceLeft { channel: ChannelId, kicked: bool },
     MemberVoiceJoined { member: MemberId, channel: ChannelId },
     MemberVoiceLeft { member: MemberId, channel: ChannelId },
-    SpeakingStarted { member: MemberId },
-    SpeakingStopped { member: MemberId },
+    /// `whispering` is TS3-only: the audio arrived as a whisper packet
+    /// (S2CWhisper) instead of normal channel voice (FEATURES.md §6.4).
+    SpeakingStarted { member: MemberId, whispering: bool },
+    SpeakingStopped { member: MemberId, whispering: bool },
     /// TS3: someone requested talk power (FEATURES.md §9.5).
     TalkPowerRequested { member: MemberId, message: String },
     AudioCanSendChanged { can: bool },
