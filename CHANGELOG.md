@@ -118,12 +118,52 @@
 - `send_whisper_to_channel` 保留原签名与 newprotocol 格式（频道定向，
   已验证），作为 `send_whisper` 的补充。
 
+### 批量补全（临时密码 / 频道组 / 图标横幅 / 密码校验 / TalkPower / 连接信息 / 3D 音频）
+
+- **临时密码**（§8.2）：`add_temp_password / temp_passwords /
+  remove_temp_password`（`servertemppassword*`；列表响应双份需去重、
+  空表 1281 按空处理——均已处理）。
+- **频道组指派**（§9.3）：`set_member_channel_group`（数据库 id 自动解析）、
+  `channel_group_members`。**修正：server/channelgrouplist 的 kind 列线上
+  名为 `type`（0=模板 1=常规 2=ServerQuery），此前读 `sgtype`/`cgtype`
+  恒为 0**。
+- **密码本地校验**（§11）：`verify_channel_password` + 导出
+  `hash_password`。实测频道密码在服务器端加盐存储（channelinfo 的哈希
+  每次创建都不同），无法远端比对——按原版客户端语义改为对照本地缓存
+  的成功哈希（join/create 成功后自动记录）；无密码频道恒 true。
+- **Talk Power**（§9.5）：`request_talk_power / cancel_talk_power_request /
+  grant_talk_power`（授予可定时自动收回）。事件
+  `TalkPowerRequested` 由 book 泵在 `client_talk_request` 0→1 跳变时发出。
+  线上备注：3.13.8 拒绝文档写法 `client_talk_request=1`（1538），
+  实际生效键为 `client_talk_request_time`，`_msg` 参数不被接受。
+- **连接/本地信息**（§11）：`member_idle_time`（`clientlist -times`）、
+  `member_connection_info / server_connection_info`（`getconnectioninfo`；
+  `clientconnectioninfo/serverconnectioninfo` 是 Query 专属，客户端协议
+  256）。协议笔记 §9 有完整怪癖清单（`clientinfo`/`channelinfo` 响应以
+  `client_default_channel`/`channel_topic` 通知名到达等）。
+- **图标/横幅**（§8.1/§11）：`upload_icon / download_icon /
+  set_member_icon / set_channel_icon / set_host_banner`。图标以
+  `i_icon_id` 权限存储（`channeledit channel_icon_id` 被 1538 拒绝），
+  icon id = CRC64-ECMA 低 32 位（无新依赖，自带实现）。
+- **3D 定位音频**（§6.5，纯本地渲染）：univox-voice `Mixer` 新增
+  `set_listener / set_member_position / clear_member_position /
+  clear_listener` 与 `mix_frame_stereo`（等功率立体声声像 + 距离衰减，
+  参考距离 2 m）；`mix_frame` 对定位成员仅做距离衰减（单声道契约不变，
+  未定位成员零回归）。`Ts3Session` 暴露
+  `set_listener_position / set_member_position / clear_member_position /
+  clear_listener_position`（需接收管线运行中）。
+
 ### 测试
 
 - 单元：book 映射（poke/left-reason/extra fixture）、identity JSON 往返、
   handshake 参数、传输句柄（本地 TCP mock）、whisper 包组装。
 - 集成补：成员定向 whisper 可收 + SpeakingStarted whispering 标记、
-  whisper 列表 CRUD/激活边界。
+  whisper 列表 CRUD/激活边界、临时密码往返、频道组指派往返、
+  verify_channel_password 正反例、talk power 授予自动收回、
+  连接信息查询、图标上传/下载/指派、hostbanner 回读。
+- 单元补：TalkPowerRequested 0→1 跳变（重复不重发）、CRC64 校验向量、
+  Mixer 定位衰减/声像（远距衰减、右侧成员右耳响、正前居中）、
+  whisper 包组装。
 - 集成（本地真实 ts3server，`tests/features_integration.rs`）：
   流式上传/下载往返、abort 删除半成品、move_channel 排序、
   server_groups/channel_groups/own_permissions/subscribe_all、

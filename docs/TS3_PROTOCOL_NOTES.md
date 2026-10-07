@@ -209,3 +209,42 @@ TS6 适配参考。
   旁观者收到的是 `clientleftview reasonid=4` + enterview。
   `notifyclientmoved` 的 reasonid 同样遵循 `Reason` 枚举（1=Moved）。
 - **clientmove 支持可选 `cpw`**（base64(sha1)）：切入密码频道用。
+
+## 9. 批量补充（2026-10，3.13.8 实测：临时密码/图标/连接信息/TalkPower）
+
+- **变量响应的怪异通知名**：`clientgetvariables` 与 `channelinfo` 的响应
+  **从不内联返回**，而是以通知形式到达，且通知名与内容无关——
+  clientinfo 的行名为 `client_default_channel`，channelinfo 的行名为
+  `channel_topic`（两行都是完整变量行）。实现上要靠「发请求后等通知」
+  （exec_list 模式）并按这些名字匹配。
+- **`servergrouplist`/`channelgrouplist` 的类型列名是 `type`**（0=模板、
+  1=常规、2=ServerQuery），文档写的 `sgtype`/`cgtype` 在线上不出现。
+- **临时密码**：`servertemppasswordadd pw=<明文> desc=… duration=<秒>
+  tcid=<cid> [tcpw=<频道密码哈希>]`；`servertemppasswordlist` 会**同时**
+  内联返回行并再发一遍 `notifyservertemppasswordlist`，需按内容去重；
+  无记录时返回 1281（同 clientpermlist，按空列表处理）。
+- **图标以 `i_icon_id` 权限存储**：`channeledit channel_icon_id=…` 被
+  3.13.8 拒绝（1538）；正确做法 `channeladdperm/channeldelperm
+  permsid=i_icon_id`。**permvalue 是 i32**，而 id 的展示/文件名是
+  u32 视角（负 permvalue 回读为正），icon id = CRC64-ECMA(内容) 低
+  32 位。`serveredit virtualserver_icon_id=…` 反而是专用键、直接可用。
+- **`clientinfo`/`clientconnectioninfo`/`serverconnectioninfo` 在客户端
+  协议里都不存在（256 或空响应）**：空闲时间走 `clientlist -times`；
+  连接质量走 `getconnectioninfo clid=X`（各客户端被服务器
+  `notifyconnectioninforequest` 询问后用 `setconnectioninfo` 推送自己的
+  统计；本库未实现推送，所以只读得到服务器测的 upstream 丢包与
+  idle 时间，ping 等字段为空）。
+- **Talk Power 请求**：文档写法 `clientupdate client_talk_request=1` 被
+  3.13.8 拒绝（非零一律 1538，Query 侧同样），`client_talk_request_msg`
+  参数也不被接受；被接受的键是 `client_talk_request_time=<unix ts>`。
+  服务器把 `client_talk_request`（时间戳）经 notifyclientupdated 中继，
+  客户端侧据此发 `TalkPowerRequested` 事件（0→1 跳变，重复更新不重发）。
+- **Talk Power 授予**：`servergroupaddclient/delclient` + 定时收回即可；
+  `servergroupsbyclientid cldbid=…` 可验证。
+- **频道密码是加盐存储的**：channelinfo 的 `channel_password` 每次创建
+  都不同（含频道身份盐），客户端无法用 base64(sha1(pw)) 直接比对——
+  本地校验只能对照自己缓存的成功哈希（原版客户端语义相同：校验本地
+  保存的密码）。`channelcreate channel_password=<明文>` 服务器自行哈希；
+  之后 `clientmove cpw=hash(明文)` / 文件传输 `cpw` 均匹配。
+- **hostbanner**：`serveredit virtualserver_hostbanner_url/_gfx_url/
+  _gfx_interval/_mode` 直接可用；回读走 initserver 的 Server.extra。

@@ -229,7 +229,7 @@ Created → Connecting → Authenticating → Handshaking → Connected
 - 接收 whisper 单独标记（`S2CWhisper`），可区分普通语音（`SpeakingStarted/Stopped.whispering`）。
 - **Whisper 列表管理**：客户端本地目标列表的增删查与激活（原版客户端功能，tsclientlib 未实现）。
 
-### 6.5 ★ 3D 定位音频 — TS3
+### 6.5 3D 定位音频 — TS3 ✓
 
 - Listener 位置/朝向属性 + **每成员 voice position**；纯客户端本地渲染（不经过服务器）。
 - 混音器支持按位置衰减（tsclientlib 未实现）。
@@ -305,7 +305,7 @@ Created → Connecting → Authenticating → Handshaking → Connected
 - `leave_server()`（KOOK `/guild/leave`、OOPZ quit、TS3 断开、Discord 退群）。
 - **邀请链接**：KOOK `/invite/create|list|delete`（TS3 无对应概念——用服务器地址 + 密码 / privilege key 承担；OOPZ 未公开；Discord `/invites` 全功能 ✓——创建/列表/撤销，含有效期与使用次数）。
 - ★ TS3 快照：`serversnapshotcreate / serversnapshotdeploy`（频道 + 权限整体备份/恢复，支持 v2/v3）。
-- ★ TS3 临时密码：`servertemppasswordadd / list / del`（限时频道/服务器密码）。
+- ✓ TS3 临时密码：`servertemppasswordadd / list / del`（限时频道/服务器密码）。
 
 ### 8.3 成员移动
 
@@ -322,7 +322,7 @@ Created → Connecting → Authenticating → Handshaking → Connected
 |------|------|
 | `member(id) / members()` | 列表可带选项：UID/away/语音/组/时间/国家/IP/徽章（映射 TS3 `clientlist` 选项；KOOK `/guild/user-list`、OOPZ `/area/v2/members`、Discord 成员列表分页/`REQUEST_GUILD_MEMBERS` chunk） |
 | `member_detail(id)` | 详情：注册时间/最后上线/总连接数/版本/平台/国家/头像（TS3 `clientinfo`；KOOK `/user/view`；OOPZ `personDetail`） |
-| ★ `member_find(name)` | 按名字查用户（TS3 `clientfind`） |
+| `member_find(name)` | 按名字查用户（TS3 `clientfind`） |
 | 在线状态 | KOOK `/user/get-online-status`、OOPZ `event 27` |
 | ★ 频道内成员 | TS3 `channelclientlist / channelclientvariable`（频道内各成员的频道级状态） |
 
@@ -353,8 +353,8 @@ Created → Connecting → Authenticating → Handshaking → Connected
 
 ### 9.5 发言权（Talk Power）
 
-- ★ 请求发言：`request_talk_power(message)`（`clientupdate client_talk_request`）→ 事件 `TalkPowerRequested`（管理员侧）。
-- ★ 授予发言：向请求者授予临时 talk-power 服务器组（`servergroupaddclient`），到期自动收回。
+- ✓ 请求发言：`request_talk_power(message)` → 事件 `TalkPowerRequested`（管理员侧）。
+- ✓ 授予发言：向请求者授予临时 talk-power 服务器组（`servergroupaddclient`），到期自动收回。
 - 频道门槛：`channel_needed_talk_power` 读取与编辑。
 
 ---
@@ -481,8 +481,8 @@ Created → Connecting → Authenticating → Handshaking → Connected
 | 语音：发送 | ✓ | ✓（RTP 推流） | ◐（Agora 桥） | ✓（RTP + AEAD） |
 | 语音：接收 | ✓（混音/抖动缓冲） | ✗（公开 API） | ◐（桥） | ✓（依赖 DAVE，§6.8） |
 | 每用户音量（本地） | ✓ ★ | ✗ | ◐ | ✓（本地混音） |
-| Whisper | ✓ ★（含列表管理） | ✗ | ✗ | ✗ |
-| 3D 定位音频 | `Ext` ★ | ✗ | ✗ | ✗ |
+| Whisper | ✓（含列表管理） | ✗ | ✗ | ✗ |
+| 3D 定位音频 | `Ext` ✓（本地混音衰减/声像） | ✗ | ✗ | ✗ |
 | Speaking 事件 | ✓ | ◐（仅服务器侧状态） | ◐（RTC 指示） | ✓（语音网关） |
 | 频道 CRUD | ✓ | ✓ | ◐ | ✓ |
 | 频道权限覆写 | ✓ | ✓ | ◐ | ✓ |
