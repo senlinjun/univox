@@ -546,8 +546,4 @@ Discord 列备注：语音收发依赖 DAVE 端到端加密实现（§6.8）；�
 
 ## 附：参考来源
 
-- TeamSpeak 3：[ReSpeak/tsclientlib](https://github.com/ReSpeak/tsclientlib)（含 `ts-bookkeeping`、`tsproto-packets`）、TS3 ServerQuery 文档（`serverquerydocs`）、ClientQuery 插件接口、[TS3 Client Plugin SDK](https://github.com/teamspeak/ts3client-pluginsdk)
-- TeamSpeak 6：[teamspeak/teamspeak6-server](https://github.com/teamspeak/teamspeak6-server)（releases/docs）、[TS6 ServerQuery 文档](https://mintlify.wiki/teamspeak/teamspeak6-server/server-query/overview.md)
-- KOOK：[developer.kookapp.cn](https://developer.kookapp.cn) 与 [kaiheila/api-docs](https://github.com/kaiheila/api-docs)、[TWT233/khl.py](https://github.com/TWT233/khl.py)、[gehongyan/Kook.Net](https://github.com/gehongyan/Kook.Net)、[shuyangzhang/kookvoice](https://github.com/shuyangzhang/kookvoice)
-- OOPZ：[DeeChael/oopz-api-docs](https://github.com/DeeChael/oopz-api-docs)、[tangqingfeng7/Oopzbot-SDK](https://github.com/tangqingfeng7/Oopzbot-SDK)（逆向协议，无官方文档）
-- Discord：[官方开发者文档](https://discord.com/developers/docs)（Gateway / Intents / Voice / Interactions / Permissions）、[discord/dave-protocol](https://github.com/discord/dave-protocol)（语音 E2EE 规范）、Rust 参考 [serenity](https://github.com/serenity-rs/serenity) / [twilight](https://github.com/twilight-rs/twilight)、[discord.py](https://github.com/Rapptz/discord.py)（语音/DAVE 实现）
+统一维护在 [README](../README.md) 的「参考实现与资料」一节。
