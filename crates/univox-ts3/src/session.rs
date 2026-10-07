@@ -165,6 +165,10 @@ pub struct Ts3Session {
     /// Active voice receive tasks (FEATURES.md §6.3).
     #[cfg(feature = "voice")]
     receiving: std::sync::Mutex<Option<VoiceTask>>,
+    /// The receive mixer, for 3D positional audio (§6.5): set while a
+    /// receive pipeline is running, cleared when it stops.
+    #[cfg(feature = "voice")]
+    recv_mixer: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<univox_voice::Mixer>>>>,
     /// Monotonic file-transfer request id (clientftfid).
     ftfid: std::sync::atomic::AtomicU32,
     /// Cached own uid (resolved lazily for avatar management).
@@ -220,6 +224,8 @@ impl Ts3Session {
             sending: std::sync::Mutex::new(None),
             #[cfg(feature = "voice")]
             receiving: std::sync::Mutex::new(None),
+            #[cfg(feature = "voice")]
+            recv_mixer: std::sync::Mutex::new(None),
             ftfid: std::sync::atomic::AtomicU32::new(1),
             own_uid: std::sync::Mutex::new(None),
             last_self_update: std::sync::Mutex::new(None),
@@ -271,6 +277,74 @@ impl Ts3Session {
 
     pub(crate) fn clid(&self) -> u16 {
         self.clid.load(std::sync::atomic::Ordering::Relaxed) as u16
+    }
+
+    // ---- 3D positional audio (§6.5, purely local rendering) ----
+
+    /// Place the local listener (applies to the mixed receive output).
+    /// Positions use an arbitrary client-local coordinate system; `forward`
+    /// and `up` are orthonormalized internally. Requires a running receive
+    /// pipeline.
+    #[cfg(feature = "voice")]
+    pub fn set_listener_position(
+        &self,
+        pos: univox_voice::Vec3,
+        forward: univox_voice::Vec3,
+        up: univox_voice::Vec3,
+    ) -> Result<()> {
+        match self.recv_mixer.lock().unwrap().as_ref() {
+            Some(m) => {
+                m.lock().unwrap().set_listener(pos, forward, up);
+                Ok(())
+            }
+            None => Err(Error::Unsupported(
+                "positional audio needs a running receive pipeline (start_receiving)".into(),
+            )),
+        }
+    }
+
+    /// Place a member in the listener's coordinate space; members without
+    /// a position mix centered at full volume.
+    #[cfg(feature = "voice")]
+    pub fn set_member_position(&self, member: &MemberId, pos: univox_voice::Vec3) -> Result<()> {
+        match self.recv_mixer.lock().unwrap().as_ref() {
+            Some(m) => {
+                m.lock().unwrap().set_member_position(member, pos);
+                Ok(())
+            }
+            None => Err(Error::Unsupported(
+                "positional audio needs a running receive pipeline (start_receiving)".into(),
+            )),
+        }
+    }
+
+    /// Remove a member's position (they mix centered again).
+    #[cfg(feature = "voice")]
+    pub fn clear_member_position(&self, member: &MemberId) -> Result<()> {
+        match self.recv_mixer.lock().unwrap().as_ref() {
+            Some(m) => {
+                m.lock().unwrap().clear_member_position(member);
+                Ok(())
+            }
+            None => Err(Error::Unsupported(
+                "positional audio needs a running receive pipeline (start_receiving)".into(),
+            )),
+        }
+    }
+
+    /// Disable positional rendering entirely (also drops all member
+    /// positions).
+    #[cfg(feature = "voice")]
+    pub fn clear_listener_position(&self) -> Result<()> {
+        match self.recv_mixer.lock().unwrap().as_ref() {
+            Some(m) => {
+                m.lock().unwrap().clear_listener();
+                Ok(())
+            }
+            None => Err(Error::Unsupported(
+                "positional audio needs a running receive pipeline (start_receiving)".into(),
+            )),
+        }
     }
 
     /// Reconnect loop: wait for the connection to die, then re-establish it
@@ -481,10 +555,10 @@ async fn run_recv_pipeline(
     mut sink: Box<dyn univox_core::audio::AudioSink>,
     codec: std::sync::Arc<univox_voice::OpusDecoder>,
     core: Arc<SessionCore>,
+    mixer: std::sync::Arc<std::sync::Mutex<univox_voice::Mixer>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut voice_rx = conn.voice_sink_handle().subscribe();
-    let mixer = std::sync::Arc::new(std::sync::Mutex::new(univox_voice::Mixer::new(5)));
     let mixer_decode = mixer.clone();
     // Per-member flag of whether their latest frame arrived as a whisper
     // packet (S2CWhisper) — read by the pacer for the speaking events.
@@ -800,7 +874,9 @@ impl Session for Ts3Session {
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let conn = self.conn();
         let core = self.core.clone();
-        let handle = tokio::spawn(run_recv_pipeline(conn, sink, codec, core, stop_rx));
+        let mixer = std::sync::Arc::new(std::sync::Mutex::new(univox_voice::Mixer::new(5)));
+        *self.recv_mixer.lock().unwrap() = Some(mixer.clone());
+        let handle = tokio::spawn(run_recv_pipeline(conn, sink, codec, core, mixer, stop_rx));
         *self.receiving.lock().unwrap() = Some(VoiceTask { stop: stop_tx, handle });
         Ok(())
     }

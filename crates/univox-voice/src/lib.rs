@@ -9,7 +9,7 @@ pub mod source;
 
 pub use codec::{OpusDecoder, OpusEncoder};
 pub use jitter::JitterBuffer;
-pub use mixer::Mixer;
+pub use mixer::{Mixer, REFERENCE_DISTANCE, Vec3};
 pub use source::SineSource;
 
 /// Canonical voice frame: 20 ms of 48 kHz mono PCM.
