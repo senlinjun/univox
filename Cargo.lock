@@ -1157,6 +1157,8 @@ dependencies = [
  "tracing-subscriber",
  "univox-core",
  "univox-ts3",
+ "univox-ts3-proto",
+ "univox-voice",
 ]
 
 [[package]]

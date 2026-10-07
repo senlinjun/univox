@@ -4,6 +4,7 @@ description = "TeamSpeak 3 wire protocol: packet codec, crypto, Init1 handshake,
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true

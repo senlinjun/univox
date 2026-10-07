@@ -4,6 +4,7 @@ description = "Platform-agnostic voice pipeline: jitter buffer, mixer, opus code
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 univox-core.workspace = true

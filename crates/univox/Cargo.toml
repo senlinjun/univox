@@ -4,14 +4,19 @@ description = "Univox facade: one API for multiple voice platforms"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 default = ["voice"]
-voice = ["univox-ts3/voice"]
+voice = ["univox-ts3/voice", "dep:univox-voice"]
 
 [dependencies]
 univox-core.workspace = true
+# voice 由本 crate 的 feature 门控（workspace 表已关 univox-ts3 默认特性）；
+# 关闭时 audiopus（静态 libopus）不得进入依赖树。
 univox-ts3.workspace = true
+univox-ts3-proto.workspace = true
+univox-voice = { workspace = true, optional = true }
 tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true

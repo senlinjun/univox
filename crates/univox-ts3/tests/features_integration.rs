@@ -928,7 +928,7 @@ async fn connection_info_queries() {
         .expect("self clid");
 
     let idle = session.member_idle_time(&me).await.expect("idle time");
-    assert!(idle.as_millis() >= 0);
+    assert!(idle < Duration::from_secs(60), "fresh session barely idle: {idle:?}");
 
     let info = session.member_connection_info(&me).await.expect("member info");
     assert!(info.idle_time.is_some(), "idle present: {info:?}");

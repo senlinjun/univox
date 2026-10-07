@@ -10,19 +10,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use univox_core::event::Event;
-use univox_core::message::MessageContent;
-use univox_core::model::MessageTarget;
-use univox_core::session::SessionManager;
-use univox_core::{ConnectOptions, Credential, SessionRequest};
-use univox_ts3::Ts3Driver;
+use univox::{
+    ChannelId, ConnectOptions, Credential, Event, MessageContent, MessageTarget, Platform,
+    SessionManager, SessionRequest, Ts3Driver,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -37,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         .nickname(&nickname)
         .credential(Credential::Anonymous);
     let session = manager
-        .connect(SessionRequest::new(univox_core::platform::Platform::Ts3, opts))
+        .connect(SessionRequest::new(Platform::Ts3, opts))
         .await?;
     println!("connected: {} (state: {:?})", session.id(), session.state());
 
@@ -48,9 +45,7 @@ async fn main() -> anyhow::Result<()> {
             Event::Connected => println!("ready"),
             Event::MemberJoined { member } => {
                 println!("+ {}", member.nickname);
-                let _ = session
-                    .poke(&member.id, "welcome! (univox echo bot)")
-                    .await;
+                let _ = session.poke(&member.id, "welcome! (univox echo bot)").await;
             }
             Event::MemberLeft { id, .. } => println!("- {id}"),
             Event::MessageCreated { message } => {
@@ -64,11 +59,8 @@ async fn main() -> anyhow::Result<()> {
                 if author != 0 && message.content != ".quit" {
                     let _ = session
                         .send_message(
-                            MessageTarget::Channel(univox_core::id::ChannelId::from_u64(1)),
-                            &MessageContent::Plain(format!(
-                                "echo: {}",
-                                message.content
-                            )),
+                            MessageTarget::Channel(ChannelId::from_u64(1)),
+                            &MessageContent::Plain(format!("echo: {}", message.content)),
                         )
                         .await;
                 }

@@ -13,7 +13,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/univox"
+repository = "https://github.com/senlinjun/univox"
 
 [workspace.dependencies]
 # async
@@ -44,11 +44,14 @@ sha2 = "0.10"
 md-5 = "0.10"
 num-bigint-dig = "0.8"
 
-# univox crates
-univox-core = { path = "crates/univox-core" }
-univox-ts3-proto = { path = "crates/univox-ts3-proto" }
-univox-ts3 = { path = "crates/univox-ts3" }
-univox-voice = { path = "crates/univox-voice" }
+# univox crates (version for crates.io publish; path wins locally)
+univox-core = { version = "0.1.0", path = "crates/univox-core" }
+univox-ts3-proto = { version = "0.1.0", path = "crates/univox-ts3-proto" }
+# default-features = false：让继承方（门面 univox）的 voice feature 统一门控
+# audiopus——关闭 voice 时静态 libopus 不进入依赖树。成员侧的
+# default-features = false 对 workspace 继承会被忽略，必须写在这里。
+univox-ts3 = { version = "0.1.0", path = "crates/univox-ts3", default-features = false }
+univox-voice = { version = "0.1.0", path = "crates/univox-voice" }
 
 # test
 test-support = { path = "crates/test-support" }
