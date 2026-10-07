@@ -4,8 +4,9 @@
 
 Univox 把多个语音平台的协议实现收敛到**一套 Rust API** 之下：同一个机器人/客户端程序可以用统一的模型（服务器、频道、成员、消息、语音流、事件）同时驱动多个平台会话，而不用为每个平台学一套 SDK。
 
-**当前状态：TeamSpeak 3 驱动完成并经真实服务器（3.13.8）验收（96 个测试
-全绿：单元 + 协议向量 + 集成）；KOOK / OOPZ / Discord 仍为规划。** 完整功能列表见
+**当前状态：TeamSpeak 3 驱动完成并经真实服务器（3.13.8）验收（148 个测试
+全绿：单元 + 协议向量 + 本地真实服务器集成）；KOOK / OOPZ / Discord 仍为
+规划。** 完整功能列表见
 **[docs/FEATURES.md](docs/FEATURES.md)**。
 
 ## TeamSpeak 3 已交付能力
@@ -31,9 +32,16 @@ cargo test --workspace          # 单元 + 协议向量 + 真实服务器集成
 cargo run -p univox --example echo_bot -- <address> [nickname]
 ```
 
+```toml
+[dependencies]
+univox = "0.1.0"        # 门面 crate：统一抽象 + TeamSpeak 3 驱动，一个依赖即可
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
 ```rust,no_run
-use univox_core::{ConnectOptions, Credential, SessionRequest, session::SessionManager};
-use univox_ts3::Ts3Driver;
+use univox::{
+    ConnectOptions, Credential, Event, Platform, SessionManager, SessionRequest, Ts3Driver,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,11 +49,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     manager.register_driver(std::sync::Arc::new(Ts3Driver));
     let opts = ConnectOptions::new("ts3server://ts.example.com?nickname=MyBot")
         .credential(Credential::Anonymous);
-    let session = manager.connect(SessionRequest::new(
-        univox_core::platform::Platform::Ts3, opts)).await?;
+    let session = manager.connect(SessionRequest::new(Platform::Ts3, opts)).await?;
+
     let mut events = session.events();
     while let Some(ev) = events.next().await {
-        // 统一事件：消息、成员进出、说话起止……
+        match &*ev {
+            Event::Connected => { /* 会话就绪 */ }
+            // 统一事件：消息、成员进出、说话起止……
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -78,4 +90,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 许可
 
-未定（实现启动时确定）。
+MIT OR Apache-2.0（见 [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE)）。

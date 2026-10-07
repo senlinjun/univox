@@ -3,7 +3,9 @@
 > **Univox**（uni + vox，"统一语音"）—— 集中多个语音平台协议的 Rust 集成库。
 > 一套统一 API 驱动 TeamSpeak 3、KOOK、OOPZ、Discord，让同一个机器人/客户端程序能同时挂载任意多个平台会话。
 >
-> **状态**：规划阶段（本文档为功能列表，不含实现）。
+> **状态**：TeamSpeak 3 驱动已交付并经真实服务器（3.13.8）验收——能力矩阵
+> （§13）TS3 列与 TS3 各小节的 ✓/◐/`Ext` 即当前实现；KOOK / OOPZ / Discord
+> 仍为规划，相应标记为目标形态。
 > **图例**：✓ 完整支持 · ◐ 部分支持 · ✗ 不支持 · `Ext` 仅平台扩展层暴露 · ★ 相对参考实现 tsclientlib 的新增规划项。
 
 ---
@@ -190,7 +192,7 @@ Created → Connecting → Authenticating → Handshaking → Connected
 
 ### 5.3 原始事件映射表
 
-文档化每个平台的原生事件 → 统一事件的映射：TS3 属性变更流（`PropertyId` 全集）、KOOK 约 35 个系统事件（`type=255` + `extra.type`）、OOPZ 约 24 个整数事件 ID、Discord Gateway dispatch 事件全集（`READY`、`GUILD_*`、`CHANNEL_*`、`MESSAGE_*`、`VOICE_*`、`INTERACTION_*` 等 40+ 类型）。未映射事件一律经 `RawEvent { platform, payload }` 透传。
+文档化每个平台的原生事件 → 统一事件的映射：TS3 映射已落地，见 [EVENT_MAPPING.md](EVENT_MAPPING.md)；KOOK 约 35 个系统事件（`type=255` + `extra.type`）、OOPZ 约 24 个整数事件 ID、Discord Gateway dispatch 事件全集（`READY`、`GUILD_*`、`CHANNEL_*`、`MESSAGE_*`、`VOICE_*`、`INTERACTION_*` 等 40+ 类型）随各驱动交付。未映射事件一律经 `RawEvent { platform, payload }` 透传。
 
 ---
 
@@ -382,26 +384,27 @@ Created → Connecting → Authenticating → Handshaking → Connected
 **★ ServerQuery 管理驱动**（独立于客户端协议的第二条接入路径；兼作未来 TS6 管理面）：
 - 连接：`login/logout/use/whoami/quit`；传输 telnet（10011）与 SSH（10022，RSA hostkey）。
 - 事件：`servernotifyregister / unregister`（事件类型 `server / channel / textserver / textchannel / textprivate`）→ 汇入统一事件总线。
-- ★ 查询账号管理：`queryloginadd / querylogindel / queryloginlist`。
-- query 级独占能力：`serverlist / servercreate / serverdelete / serverstart / serverstop / serverprocessstop`、`instanceinfo/instanceedit`、`hostinfo`、`bindinglist`、`serveridgetbyport` ★、`gm` 全局广播、`logview` 过滤查询。
+- 通用命令面：`exec / exec_one` 直发任意 ServerQuery 命令并收结构化行——查询账号管理（`queryloginadd / querylogindel / queryloginlist`）、实例管理（`serverlist / servercreate / serverdelete / serverstart / serverstop / serverprocessstop`、`instanceinfo/instanceedit`、`hostinfo`、`bindinglist`、`serveridgetbyport` ★）、`gm` 全局广播、`logview` 过滤查询均经此调用。
 
 **★ 插件命令转发**：`send_plugin_command(payload, target: Single / CurrentTab / Clients / All)` + `PluginCommandReceived` 事件（`plugincmd`，客户端间经服务器中继）。
 
-**★ 头像 / 图标 / 横幅**：`avatar_set / avatar_get / avatar_remove`（文件传输 `/avatar_<dbid>`）、`icon_upload / icon_download`（`icon_<iconid>`）、频道横幅设置。
+**★ 头像 / 图标 / 横幅**：`upload_avatar`（上传后自动 `clientupdate client_flag_avatar`）、`download_avatar` / `download_avatar_by_uid` / `avatar_path`；`upload_icon / download_icon` + `set_member_icon / set_channel_icon`（图标以 `i_icon_id` 权限存储，icon id = CRC64-ECMA 低 32 位）；`set_host_banner`。
 
 **★ 运行时自身状态**（`clientupdate` 全字段）：频道指挥官、优先说话者、录音中、徽章（含签名徽章）、客户端描述、`meta_data`、默认 token、运行时改名/away/静音。
 
-**★ 密码本地校验**：`verify_server_password / verify_channel_password`（`hashpassword` 本地哈希比对，不发服务器）。
+**★ 密码本地校验**：`verify_channel_password` + 导出 `hash_password`（不发服务器；频道密码服务器端加盐存储、无法远端比对——按原版客户端语义对照本地缓存的成功哈希，join/create 成功后自动记录；无密码频道恒 true）。
 
-**其余**：
-- privilege key（特权密钥）：`privilegekeyadd/use/delete/list`（`token*` 兼容别名）。
-- 文件传输完整面：`upload / download`（断点续传 seek、覆盖开关）、`list_files`（`ftgetfilelist`）、`file_info`、`delete_file`、`create_dir`、`rename_file`、传输列表（`ftlist`）、`stop_transfer`；上传/下载配额属性。
-- 频道树订阅：`subscribe / unsubscribe / subscribe_all / unsubscribe_all` + 订阅变更事件。
-- 日志：`add_log`（`logadd` 写自定义日志行）。
-- myTeamSpeak 集成变量：`client_myteamspeak_id`、签名徽章。
-- ★ 客户端本地信息查询：服务器/频道连接信息（`serverconnectinfo / channelconnectinfo`）、当前声音处理器 ID（`currentschandlerid`）、成员空闲时间（`client_idle_time`）。
-- 解析器：SRV DNS（`_ts3._udp.<host>`）+ TSDNS（TCP 41144）地址解析、昵称解析。
-- 协议级：identity 安全等级提升（§3）、License 类型读取、连接加密。
+**其余（已交付）**：
+- 文件传输：`upload_file / download_file`（整缓冲）与 `upload_file_stream / download_file_stream`（流式句柄：进度/分块/中止，取消自动删除半成品）、`list_files`、`create_dir`、`delete_file`（密码频道收明文、内部哈希）；头像/图标经同一 TCP 通道。
+- 服务器快照：`server_snapshot / deploy_server_snapshot`。
+- 频道树订阅：`subscribe_all`（全量订阅）。
+- 本地成员静音：`mute_members / unmute_members`。
+- ★ ID 映射与查询：`uid_from_clid`、`dbid_from_uid`、`name_from_uid`、`name_from_dbid`、`clientfind`、clientdb 管理（§9.2）、自定义字段（`custominfo / customsearch`）。
+- ★ 客户端本地信息：成员空闲时间（`clientlist -times`）、成员/服务器连接信息（`getconnectioninfo`）。
+- 解析器：SRV DNS（`_ts3._udp.<host>`）+ TSDNS（TCP 41144）地址解析、`ts3server://` 邀请链接。
+- 协议级：identity 安全等级提升（§3）、连接加密。
+
+**尚未暴露（规划）**：privilege key 管理 API（连接时消费已支持，`Ts3ConnectOptions`）、单频道订阅/退订、`add_log`（`logadd`）、文件重命名/信息查询/配额、声音处理器 ID（`currentschandlerid`）。
 
 ### 11.2 KOOK 扩展（`KookExt`）
 

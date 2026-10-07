@@ -1,8 +1,31 @@
 # Changelog
 
-## Unreleased — 客户端 API 补全（连接/身份/事件/传输/构建）
+## 0.1.0 — 2026-10-07
 
-面向下游嵌入方的一批 API 补全与保真度修复；多项是既有抽象的接线补全
+首个公开版本：**TeamSpeak 3 驱动完整交付**，经真实服务器（3.13.8）验收
+（148 个测试全绿：单元 + 协议向量 + 本地真实服务器集成；另有 3 个长时/手动
+回归默认 `--ignored`）。
+
+- **univox** —— 门面 crate：单依赖获得统一抽象与全部已交付驱动；根平铺
+  re-export（`univox::{ConnectOptions, Event, Ts3Driver, …}`）+ 模块别名
+  `core / ts3 / proto / voice`；`voice` feature（默认开启）统一门控
+  audiopus——`default-features = false` 时静态 libopus 完全退出依赖树。
+- **univox-core** —— 统一数据模型（Server/Channel/Member/Message/Role）、
+  Session/Driver trait、统一事件总线、状态簿记（Book）、能力声明、多会话
+  管理器、凭据抽象、限速器、音频 trait。
+- **univox-ts3-proto** —— TS3 线协议：包头编解码、Init1+RSA 谜题握手、
+  initivexpand2 Curve25519/ECDSA 证书链、EAX 加密、分片/QuickLZ、
+  P-256 identity（tsclientlib JSON 兼容）、命令序列化。
+- **univox-ts3** —— 原生客户端协议驱动（UDP 9987；断线监督、自动重连、
+  状态恢复）+ ServerQuery 管理驱动（raw/SSH）；消息与管理面、whisper、
+  文件传输、头像/图标/横幅、临时密码、频道组、Talk Power、连接信息，
+  经 `Ts3Ext` 平台扩展 trait 暴露。
+- **univox-voice** —— Opus 编解码、逐成员抖动缓冲、混音器、3D 定位音频
+  （距离衰减 + 立体声声像）。
+- KOOK / OOPZ / Discord 驱动仍为规划（功能面与平台能力矩阵见
+  docs/FEATURES.md）。
+
+以下为发布前最后一批客户端 API 补全的明细；多项是既有抽象的接线补全
 （`with_extension` 槽、`ChannelOptions.extra`、`hash_password` 此前为空置）。
 
 ### 连接与身份
@@ -70,7 +93,7 @@
   验收：`cargo check -p univox-ts3 --no-default-features` 通过、
   `cargo tree` 无 audiopus、默认构建与 `cargo test --workspace` 不变。
 
-### 二轮反馈（身份回写 / counter 语义 / create_dir）
+### 身份回写 / counter 语义 / create_dir
 
 - **`Ts3Session::identity() -> &Identity`**：connect（含
   `upgrade_identity_to` 升级）后的最终身份可读回；调用方应在连接后持久化
@@ -84,7 +107,7 @@
 - **`Ts3Ext::create_dir(channel, path, password)`**（`ftcreatedir`，参数名
   为 `dirname`）。
 
-### 三轮反馈（重连自状态 / ClientMoved reason / 传输密码 / join_voice）
+### 重连自状态 / ClientMoved reason / 传输密码 / join_voice
 
 - **重连恢复自身状态**：`update_self` 应用过的最后一份运行时状态（away、
   指挥官、徽章等）在重连成功后自动重放（`restore_state` 开启时）；
@@ -118,7 +141,7 @@
 - `send_whisper_to_channel` 保留原签名与 newprotocol 格式（频道定向，
   已验证），作为 `send_whisper` 的补充。
 
-### 批量补全（临时密码 / 频道组 / 图标横幅 / 密码校验 / TalkPower / 连接信息 / 3D 音频）
+### 命令面补全（临时密码 / 频道组 / 图标横幅 / 密码校验 / TalkPower / 连接信息 / 3D 音频）
 
 - **临时密码**（§8.2）：`add_temp_password / temp_passwords /
   remove_temp_password`（`servertemppassword*`；列表响应双份需去重、
