@@ -197,6 +197,9 @@ pub struct ConnectionStats {
     pub packet_loss: f32,
     pub bandwidth_up: u64,
     pub bandwidth_down: u64,
+    /// Command packets awaiting their ack; 0 on a healthy link. Stuck
+    /// non-zero means the peer's acks are not being processed.
+    pub pending_commands: usize,
     pub reconnect_count: u64,
 }
 

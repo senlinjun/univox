@@ -196,3 +196,28 @@ async fn connection_stats_are_populated() {
 
     session.disconnect(None).await.ok();
 }
+
+/// Manual regression (`--ignored`, ~3 min): an idle session must survive
+/// past the resend give-up window (12 resends ≈ 147 s). Before the
+/// unencrypted-ack fix, the first post-connect command's ack was never
+/// processed and the give-up killed every session at ~2.5 minutes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "long: idles past the resend give-up window (~3 min)"]
+async fn idle_session_survives_past_resend_give_up() {
+    let server = Ts3Server::start().await.expect("boot");
+    let session = connect_session(&server, "Sofa Bot").await;
+
+    tokio::time::sleep(Duration::from_secs(160)).await;
+
+    let stats = session.stats();
+    assert_eq!(
+        stats.pending_commands, 0,
+        "command acks stuck; the connection would give up"
+    );
+    session
+        .exec(univox_ts3_proto::Command::new("whoami"))
+        .await
+        .expect("connection dead before the give-up window elapsed");
+
+    session.disconnect(None).await.ok();
+}
